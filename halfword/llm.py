@@ -284,11 +284,15 @@ def branch_alternatives(tops: list[tuple[str, float]], greedy: str, remaining: s
 
 
 class LLM:
-    def __init__(self, model_file: str, threads: int = 4, port: int = 8767, ctx: int = 2048):
+    def __init__(self, model_file: str, threads: int = 4, port: int = 8767, ctx: int = 2048,
+                 cache_ram_mb: int = 128):
         self.model = MODELS_DIR / model_file
         self.threads = threads
         self.port = port
         self.ctx = ctx
+        # кэш промптов llama-server: по умолчанию до 8 ГБ, у Gemma 3 1B ~11 МБ на контекст;
+        # 128 МБ ≈ 11 последних окон — возврат в окно 0.2 с вместо 2.4 с без роста памяти
+        self.cache_ram_mb = cache_ram_mb
         # окно промпта (символы) и режим паузы; app перезаписывает из config
         self.keep_quick = 350
         self.keep_long = 1000
@@ -332,7 +336,8 @@ class LLM:
             logf = open(LLM_DIR / "server.log", "w", encoding="utf-8", errors="replace")
             self.proc = subprocess.Popen(
                 [str(SERVER_EXE), "-m", str(self.model), "--host", "127.0.0.1", "--port", str(self.port),
-                 "-c", str(self.ctx), "-t", str(self.threads), "-np", "1"],
+                 "-c", str(self.ctx), "-t", str(self.threads), "-np", "1",
+                 "--cache-ram", str(self.cache_ram_mb)],
                 stdout=logf, stderr=subprocess.STDOUT,
                 creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
             self.ready = False
