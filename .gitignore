@@ -1,0 +1,19 @@
+# Документация проекта и правила для Claude живут в хранилище Obsidian автора, в git не идут
+Документация/
+CLAUDE.md
+.claude/
+
+# Личные данные: модели на ваших текстах, статистика, логи, экспорт Telegram
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Прочее
+*.log
+.env
+*.gguf
