@@ -39,14 +39,17 @@ class _MARGINS(ctypes.Structure):
 
 
 # Палитры. Светлая — исходная; тёмная — под тёмную тему Windows.
+# Фон и текст нейтральные (плашка живёт в чужих программах), акцент — янтарь панели и иконки трея.
 LIGHT = dict(bg="#F4F4F4", fg="#6B6B6B", fg_long="#8E8E8E", hint="#A0A0A0", border="#C8C8C8",
-             key_border="#D2D2D2", accent="#7A6FD0")
+             key_border="#D2D2D2", accent="#B06C0B")
 DARK = dict(bg="#2B2B2B", fg="#C8C8C8", fg_long="#9A9A9A", hint="#7A7A7A", border="#3C3C3C",
-            key_border="#4A4A4A", accent="#A99CFF")
+            key_border="#4A4A4A", accent="#E8A23A")
 PALETTES = {"light": LIGHT, "dark": DARK}
 BG, FG, HINT, BORDER, FG_LONG = LIGHT["bg"], LIGHT["fg"], LIGHT["hint"], LIGHT["border"], LIGHT["fg_long"]
 
 ALPHA = 0.93
+SYMBOL_FONT = "Segoe UI Symbol"      # ✦ ⇄ ✎: в Segoe UI их нет, подстановка даёт мелкие пятна
+WRAP_EM = 28                         # длинная ✦✦ переносится на столько em, чтобы Tab и «2/3» были рядом
 FADE_STEPS, FADE_STEP_MS = 4, 20     # ~80 мс при появлении из скрытого состояния
 THEME_RECHECK_S = 30                 # реестр перечитываем не чаще
 _PERSONALIZE = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
@@ -82,6 +85,12 @@ def parse_hint(hint: str) -> tuple[str, str, str]:
     if not m:
         return (hint or "").strip(), "", ""
     return m.group(1), m.group(2) or "", m.group(3) or ""
+
+
+def split_lead(text: str) -> tuple[int, str]:
+    """« десять утра» -> (1, «десять утра»): ведущие пробелы не рисуем внутри плашки, а сдвигаем её саму."""
+    body = text.lstrip(" ")
+    return (len(text) - len(body), body) if body else (0, text)
 
 
 def needs_update(prev: tuple | None, new: tuple, visible: bool) -> bool:
@@ -129,6 +138,7 @@ class Overlay:
         self._pos: tuple[int, int] | None = None
         self._px = 0
         self._one = 0
+        self._space = 0
         self._shown_parts: dict[str, bool] = {"src": False, "cnt": False}
         self._fade_job = None
         pal = self._pick_palette(force=True)
@@ -142,7 +152,9 @@ class Overlay:
         self.inner.pack(padx=1, pady=1)
         self.font = tkfont.Font(family=family, size=-16)
         self.hint_font = tkfont.Font(family=family, size=-11)
-        self.text = tk.Label(self.inner, bg=pal["bg"], fg=pal["fg"], font=self.font, padx=4, pady=0)
+        self.sym_font = tkfont.Font(family=SYMBOL_FONT, size=-13)
+        self.text = tk.Label(self.inner, bg=pal["bg"], fg=pal["fg"], font=self.font, padx=4, pady=0,
+                             justify="left")  # перенесённая ✦✦ читается с левого края, а не по центру
         self.text.pack(side="left")
         # подсказка: клавиша в рамке + значок источника + счётчик вариантов
         self.hint_box = tk.Frame(self.inner, bg=pal["bg"])
@@ -153,7 +165,7 @@ class Overlay:
         self.key = tk.Label(self.key_box, text="Tab", bg=pal["bg"], fg=pal["hint"], font=self.hint_font,
                             padx=3, pady=0)
         self.key.pack()
-        self.src = tk.Label(self.hint_box, bg=pal["bg"], fg=pal["accent"], font=self.hint_font, padx=0)
+        self.src = tk.Label(self.hint_box, bg=pal["bg"], fg=pal["accent"], font=self.sym_font, padx=0)
         self.cnt = tk.Label(self.hint_box, bg=pal["bg"], fg=pal["hint"], font=self.hint_font, padx=0)
         self.win.update_idletasks()
         self.hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
@@ -259,14 +271,18 @@ class Overlay:
         if px != self._px:
             self.font.configure(size=-px)
             self.hint_font.configure(size=-max(9, int(px * 0.65)))
+            self.sym_font.configure(size=-max(11, int(px * 0.85)))
             self._px = px
             self._one = self.font.metrics("linespace") + 2
+            self._space = self.font.measure(" ")
             dirty = True
         left, _top, right, bottom = work_area(x, y)
         # длинную подсказку переносим, чтобы не уезжала за край экрана
-        wrap = max(px * 12, min(px * 40, right - x - px * 5)) if long else 0
+        wrap = max(px * 12, min(px * WRAP_EM, right - x - px * 5)) if long else 0
         key, src, cnt = parse_hint(hint)
-        dirty |= self._cfg("text", self.text, text=text, fg=pal["fg_long"] if long else pal["fg"], wraplength=wrap)
+        lead, body = split_lead(text)
+        x += lead * self._space
+        dirty |= self._cfg("text", self.text, text=body, fg=pal["fg_long"] if long else pal["fg"], wraplength=wrap)
         dirty |= self._cfg("key", self.key, text=key)
         dirty |= self._part("src", self.src, src)
         dirty |= self._part("cnt", self.cnt, cnt)

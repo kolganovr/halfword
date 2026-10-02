@@ -59,3 +59,15 @@ class NeedsUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SplitLeadTest(unittest.TestCase):
+    def test_leading_spaces_move_out(self):
+        self.assertEqual(O.split_lead(" десять утра"), (1, "десять утра"))
+        self.assertEqual(O.split_lead("ла"), (0, "ла"))
+
+    def test_only_spaces_kept(self):
+        self.assertEqual(O.split_lead("  "), (0, "  "))
+
+    def test_accent_is_brand_amber(self):
+        self.assertEqual(O.DARK["accent"].lower(), "#e8a23a")
