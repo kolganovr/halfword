@@ -130,6 +130,8 @@ class SecurityTest(PanelBase):
         st, _, r, raw = self.req("GET", "/", headers={"Cookie": f"st_token={self.panel.token}"}, token=False)
         self.assertEqual(st, 200)
         self.assertIn(self.panel.token.encode(), raw)  # токен для X-Token встроен в страницу
+        self.assertIn("frame-ancestors 'none'", r.getheader("Content-Security-Policy"))
+        self.assertIn("script-src 'self'", r.getheader("Content-Security-Policy"))
         self.assertEqual(self.req("GET", "/app.js", headers={"Cookie": f"st_token={self.panel.token}"}, token=False)[0], 200)
 
     def test_fonts_whitelist(self):

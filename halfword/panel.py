@@ -34,6 +34,10 @@ STATIC = {"/app.js": "application/javascript; charset=utf-8", "/style.css": "tex
 FONTS = [f"/fonts/{n}-{s}-wght-normal.woff2" for n in ("onest", "jetbrains-mono") for s in ("latin", "cyrillic")]
 STATIC.update({f: "font/woff2" for f in FONTS})  # шрифты не меняются между версиями — их можно кешировать
 MAX_BODY = 64 * 1024
+# второй слой после токена и Host/Origin: только свои скрипты и запросы, без встраивания в чужие страницы.
+# style-src 'unsafe-inline' — ширины столбиков и полос задаются атрибутом style
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 PORT_TRIES = 8          # panel_port, +1 … +7
 CALL_TIMEOUT = 2.0
 USAGE_TTL_S = 10.0      # журнал читаем с диска не чаще
@@ -789,7 +793,8 @@ def _make_handler(panel: PanelServer):
                     page = (WEB_DIR / "index.html").read_text(encoding="utf-8").replace("__TOKEN__", panel.token)
                 except OSError:
                     return self._fail(500, "нет web/index.html")
-                return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+                return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                                  {"Content-Security-Policy": CSP, "X-Frame-Options": "DENY"})
             if u.path in STATIC:
                 try:
                     return self._send(200, (WEB_DIR / u.path[1:]).read_bytes(), STATIC[u.path],

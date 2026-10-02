@@ -149,8 +149,24 @@ function moveInk() {
 addEventListener("resize", debounce(moveInk, 100));
 document.fonts && document.fonts.ready.then(moveInk);
 
+let leaveGuard = null;  // форма с несохранёнными правками: () => сколько полей изменено
+let shownHash = location.hash;
+async function onHash() {
+  if (location.hash === shownHash) return;
+  if (leaveGuard && leaveGuard() && !(await ask("Есть несохранённые изменения настроек. Уйти без сохранения?", "Уйти", true))) {
+    history.replaceState(null, "", shownHash || "#overview");  // остаёмся: адрес назад без нового hashchange
+    moveInk();
+    return;
+  }
+  route();
+}
+addEventListener("beforeunload", e => { if (leaveGuard && leaveGuard()) { e.preventDefault(); e.returnValue = ""; } });
+
 function route() {
+  shownHash = location.hash;
+  leaveGuard = null;
   const [name, arg] = (location.hash || "#overview").slice(1).split(":");
+  if (!arg) window.scrollTo({ top: 0, behavior: "instant" });  // новая вкладка — с начала, а не с прокрутки прошлой
   tab = TABS[name] ? name : "overview";
   focusKey = arg || null;
   document.querySelectorAll("#tabs a").forEach(a => {
@@ -171,7 +187,7 @@ function route() {
     shown();
   });
 }
-addEventListener("hashchange", route);
+addEventListener("hashchange", onHash);
 
 // ---------- связь с программой ----------
 let es = null;
@@ -293,7 +309,7 @@ async function overview() {
         h("span", { class: "big" }, num(t.saved)),
         h("div", { class: "hero-side" },
           delta != null ? h("span", { class: "delta" + (delta >= 0 ? " up" : ""), title: "доля сэкономленного от всего набора: сегодня против 7 дней" },
-            (delta >= 0 ? "▲ +" : "▼ −") + Math.abs(delta).toFixed(1).replace(".", ",") + " п.п.") : null,
+            (delta >= 0 ? "▲ +" : "▼ −") + Math.abs(delta).toFixed(1).replace(".", ",") + " п.п. к 7 дням") : null,
           h("span", { class: "unit" }, "нажатий сэкономлено", h("br"), `${pct(t.share, 1)} от всего набора`))),
       h("div", { class: "hero-sub" },
         h("span", {}, "принято ", h("b", {}, num(t.accepted)), " из ", h("b", {}, num(t.shown)), t.shown ? ` · ${pct(t.accept_rate)}` : ""),
@@ -340,6 +356,12 @@ async function overview() {
   every(async () => { if (tab === "overview") try { Object.assign(ov, await api("/api/overview")); paintHero(); drawChart(); } catch (e) { /* ждём следующего */ } }, 15000);
 }
 
+// ближайший «круглый» шаг не меньше x: 1, 2, 2.5, 5 × 10^n (для целых счётчиков — не меньше 1)
+function niceStep(x) {
+  if (x <= 1) return 1;
+  const p = 10 ** Math.floor(Math.log10(x)), f = x / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 && p >= 10 ? 2.5 : f <= 5 ? 5 : 10) * p;
+}
 function barChart(box, daily, key) {
   if (!daily.some(d => d[key])) {
     box.replaceChildren(empty("За 30 дней данных нет", "График заполнится, когда вы начнёте печатать с включёнными подсказками."));
@@ -347,18 +369,20 @@ function barChart(box, daily, key) {
   }
   const W = Math.max(280, box.clientWidth || 900), narrow = W < 560;
   const H = narrow ? 170 : 230, L = 40, B = 26, T = 10, R = 0;
-  const max = Math.max(1, ...daily.map(d => d[key]));
+  // верх шкалы — круглое число: 1 448 → деления 500 / 1 000 / 1 500
+  const raw = Math.max(1, ...daily.map(d => d[key]));
+  const tick = niceStep(raw / 3), max = Math.ceil(raw / tick) * tick;
   const step = (W - L - R) / daily.length, gap = Math.max(2, step * 0.42), bw = step - gap;
   const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${METRIC_NAMES[key]} по дням за 30 дней` });
   const gid = "g" + key;
   s.append(svg("defs", {}, svg("linearGradient", { id: gid, x1: 0, y1: 0, x2: 0, y2: 1 },
     svg("stop", { offset: "0", "stop-color": "var(--accent)", "stop-opacity": ".78" }),
     svg("stop", { offset: "1", "stop-color": "var(--accent)", "stop-opacity": ".1" }))));
-  (max >= 4 ? [0, 0.5, 1] : [0, 1]).forEach(f => {
-    const y = T + (H - B - T) * (1 - f);
+  for (let v = 0; v <= max + tick / 2; v += tick) {
+    const y = T + (H - B - T) * (1 - v / max);
     s.append(svg("line", { class: "gl", x1: L, x2: W - R, y1: y, y2: y }),
-             svg("text", { class: "ax", x: L - 10, y: y + 3.5, "text-anchor": "end" }, f ? num(Math.round(max * f)) : "0"));
-  });
+             svg("text", { class: "ax", x: L - 10, y: y + 3.5, "text-anchor": "end" }, num(Math.round(v))));
+  }
   const cols = [];
   daily.forEach((d, i) => {
     const bh = (H - B - T) * d[key] / max, x = L + i * step + gap / 2, last = i === daily.length - 1;
@@ -407,6 +431,7 @@ function makeForm(d, opts = {}) {
   document.body.insertBefore(bar, document.getElementById("toast"));
   cleanup.push(() => bar.remove());
   const paintBar = () => { const n = Object.keys(dirty).length; count.textContent = n; bar.classList.toggle("on", n > 0); };
+  leaveGuard = () => Object.keys(dirty).length;
 
   // [узел, элемент, прочитать, записать]
   function control(s) {
@@ -595,9 +620,9 @@ function historyTable(rows) {
 
 // ---------- Журнал подсказок ----------
 // шесть исходов сводим в три группы: их цвета различимы, подробности — во всплывающей подсказке
-const OUT_NAMES = { accepted: "Tab целиком", partial: "по словам (Ctrl+→)", typed: "напечатал её сам", dismissed: "Esc",
-  lost: "ушёл: клик, другое окно", diverged: "начал печатать другое" };
-const GROUPS3 = [["took", "принял", ["accepted", "partial"]], ["skip", "не стал брать", ["typed", "dismissed", "lost"]], ["miss", "мимо", ["diverged"]]];
+const OUT_NAMES = { accepted: "Tab целиком", partial: "по словам (Ctrl+→)", typed: "напечатали её сами", dismissed: "Esc",
+  lost: "ушли: клик, другое окно", diverged: "начали печатать другое" };
+const GROUPS3 = [["took", "приняли", ["accepted", "partial"]], ["skip", "не взяли", ["typed", "dismissed", "lost"]], ["miss", "мимо", ["diverged"]]];
 const took = g => ((g.accepted || 0) + (g.partial || 0)) / (g.n || 1);
 function stack3(g) {
   const parts = GROUPS3.map(([k, name, outs]) => ({ k, name, outs, n: outs.reduce((a, o) => a + (g[o] || 0), 0) })).filter(x => x.n);
@@ -638,8 +663,13 @@ async function usage() {
   const box = h("div", {});
   view.replaceChildren(
     pageHead("что происходит с подсказками", "Журнал подсказок", "Каждая показанная подсказка и что вы с ней сделали. Тексты в журнал не пишутся — только исходы.",
-      segmented([[7, "7 дней"], [30, "30 дней"]], days, v => { days = +v; load(); }, "Период")),
+      segmented([[7, "7 дней"], [30, "30 дней"]], days, v => { days = +v; reload(); }, "Период")),
     box);
+  // смена периода: старые цифры гаснут на время загрузки, ошибка — тостом, а не необработанным исключением
+  async function reload() {
+    box.classList.add("loading");
+    try { await load(); } catch (e) { toast(e.message, true); } finally { box.classList.remove("loading"); }
+  }
   async function load() {
     const [u, bl] = await Promise.all([api("/api/usage?days=" + days), api("/api/blacklist")]);
     if (!u.total) { box.replaceChildren(empty("За этот период в журнале пусто", "Поработайте с включёнными подсказками — исходы появятся здесь.")); return; }
@@ -650,7 +680,7 @@ async function usage() {
     part.push(sec("Главное", `за ${days} дней`, ins.length ? h("div", { class: "insights" }, ins.map(i => h("div", { class: "insight" },
       h("p", {}, i.text),
       i.go ? h("a", { class: "btn sm ghost", href: i.go[1] }, i.go[0] + " →") : null,
-      i.exe ? h("button", { class: "btn sm ghost", onclick: async () => { if (await blockExe(i.exe, true)) load(); } }, "Выключить здесь") : null))) :
+      i.exe ? h("button", { class: "btn sm ghost", onclick: async () => { if (await blockExe(i.exe, true)) reload(); } }, "Выключить здесь") : null))) :
       h("p", { class: "muted" }, "Явных проблем не видно: подсказки принимают ровно по всем местам и программам.")));
 
     const tot = Object.fromEntries(GROUPS3.map(([k, , outs]) => [k, u.sources.reduce((a, s) => a + outs.reduce((b, o) => b + (s.all[o] || 0), 0), 0)]));
@@ -665,12 +695,12 @@ async function usage() {
         h("tbody", {}, rows.map(([r, total]) => h("tr", { class: total ? "total" : "" }, h("td", {}, r.name), h("td", { class: "n" }, num(r.n)),
           h("td", { class: "w" }, stack3(r)), h("td", { class: "n" }, pct(took(r))), h("td", { class: "n" }, num(r.saved)))))))));
     });
-    if (u.hand.n) part.push(sec("Напечатал сам то, что было на плашке", null, h("div", { class: "facts" },
+    if (u.hand.n) part.push(sec("Напечатали сами то, что было на плашке", null, h("div", { class: "facts" },
       h("div", { class: "fact" }, h("div", { class: "label" }, "раз"), h("div", { class: "v" }, num(u.hand.n)),
         h("p", {}, "≥ 4 совпавших символа. По источнику: " + Object.entries(u.hand.by_src).map(([k, v]) => `${srcName(k)} ${v}`).join(", "))),
       h("div", { class: "fact" }, h("div", { class: "label" }, "на быстром наборе"), h("div", { class: "v" }, pct(u.hand.fast_share)),
         h("p", {}, "Печатали слишком быстро, чтобы заметить подсказку.")),
-      u.late.n ? h("div", { class: "fact" }, h("div", { class: "label" }, "принял не сразу"), h("div", { class: "v" }, num(u.late.n)),
+      u.late.n ? h("div", { class: "fact" }, h("div", { class: "label" }, "приняли не сразу"), h("div", { class: "v" }, num(u.late.n)),
         h("p", {}, `В среднем после ${String(u.late.avg_chars).replace(".", ",")} символов, набранных руками.`)) : null)));
 
     // источники — столбцы, виды расхождения или правки — строки
@@ -686,9 +716,9 @@ async function usage() {
           return h("td", { class: "n" }, x ? cell(x) : h("span", { class: "faint" }, "—"));
         })))))));
     };
-    part.push(crossTable("Чем расходишься с подсказкой", "доля расхождений · сколько раз", u.miss, m => `${pct(m.share)} · ${m.n}`));
+    part.push(crossTable("Чем набранное расходится с подсказкой", "доля расхождений · сколько раз", u.miss, m => `${pct(m.share)} · ${m.n}`));
     const fixKinds = Object.fromEntries(Object.entries(u.fix).map(([src, f]) => [src, f.kinds]));
-    const fixSec = crossTable("Что делаешь после принятия", "доля принятых", fixKinds, k => pct(k.share));
+    const fixSec = crossTable("Что вы делаете после принятия", "доля принятых", fixKinds, k => pct(k.share));
     if (fixSec) {
       const what = Object.entries(u.fix).filter(([, f]) => f.what.length).map(([src, f]) => `${srcName(src)}: ${f.what.map(w => `${w.name} ${w.n}`).join(", ")}`);
       if (what.length) fixSec.append(h("p", { class: "small muted after" }, "что правили — " + what.join("; ")));
@@ -704,7 +734,7 @@ async function usage() {
           h("td", { class: "w" }, meter(f)),
           h("td", { class: "small muted" }, Object.entries(a.by_src).map(([k, v]) => `${srcName(k)} ${v.acc}/${v.n}`).join(" · ")),
           h("td", { class: "row-act" }, a.app === "?" ? null : h("button", { class: "link" + (off ? "" : " danger"),
-            onclick: async () => { if (await blockExe(a.app, !off)) load(); } }, off ? "включить" : "выключить здесь")));
+            onclick: async () => { if (await blockExe(a.app, !off)) reload(); } }, off ? "включить" : "выключить здесь")));
       }))))));
     box.replaceChildren(...part.filter(Boolean));
   }
