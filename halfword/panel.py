@@ -385,6 +385,15 @@ def explain(p, text: str, s) -> dict:
     return out
 
 
+def overlay_theme(app) -> str:
+    """light|dark — в какой теме сейчас рисуется плашка (для её превью в Песочнице)."""
+    try:
+        from .overlay import resolve_theme
+        return resolve_theme(getattr(app.cfg, "overlay_theme", "auto"))
+    except Exception:  # noqa: BLE001 — без tkinter/реестра превью просто светлое
+        return "light"
+
+
 def sandbox(app, text: str) -> dict:
     """Что подскажет n-граммная модель на этот текст и почему. ГЛАВНЫЙ ПОТОК."""
     p = app.predictor
@@ -397,7 +406,7 @@ def sandbox(app, text: str) -> dict:
                                                "level_name": LEVEL_NAMES.get(s.level, s.level),
                                                "confidence": round(s.confidence, 3), "whole_word": s.whole_word},
             "explain": explain(p, text, s),
-            "ms": round(ms, 2), "context": {"c2": c2, "c1": c1, "prefix": prefix},
+            "ms": round(ms, 2), "context": {"c2": c2, "c1": c1, "prefix": prefix}, "theme": overlay_theme(app),
             "top": [{"word": p.surface(w), "p": round(pr, 4), "support": sup.get(w, 0)} for w, pr in dist[:8]]}
 
 

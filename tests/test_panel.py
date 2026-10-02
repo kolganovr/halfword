@@ -318,6 +318,9 @@ class ApiTest(PanelBase):
         self.assertEqual(js["top"][0]["word"], "дела")
         self.assertGreater(js["top"][0]["support"], 0)
         self.assertIsNone(self.req("POST", "/api/sandbox", {"text": "Привет,"})[1]["suggestion"])
+        self.assertIn(js["theme"], ("light", "dark"))  # превью плашки — в её текущей теме
+        self.app.cfg.overlay_theme = "dark"
+        self.assertEqual(self.req("POST", "/api/sandbox", {"text": "Привет"})[1]["theme"], "dark")
 
     def test_status_program_and_pause(self):
         self.app.typed_exe = "word.exe"

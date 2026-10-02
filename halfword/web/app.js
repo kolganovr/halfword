@@ -805,26 +805,45 @@ async function settings() {
 
 // ---------- Песочница ----------
 const ctxWord = w => (w.startsWith("<") ? "начало" : `«${w}»`);
+// значок источника на плашке — как в App._show
+const MARKS = { llm: "✦", long: "✦✦", layout: "⇄", snippet: "✎" };
+// плашка так, как её рисует overlay.py: текст подсказки, клавиша в рамке, значок; ведущий пробел — отступом
+function ovChip(insert, level) {
+  const body = insert.replace(/^ +/, "");
+  return h("span", { class: "ov" + (body.length < insert.length ? " gap" : "") },
+    h("span", { class: "ov-t" }, body), h("span", { class: "ov-k" }, status ? status.key : "Tab"),
+    MARKS[level] ? h("span", { class: "ov-m" }, MARKS[level]) : null);
+}
 async function sandbox() {
-  const hint = () => h("span", { class: "none" }, "Начните печатать — здесь появится подсказка");
-  const plate = h("div", { class: "plate" }, hint(), h("kbd", {}, "Tab"));
+  let theme = null;  // тема превью: с сервера (как у плашки сейчас), можно переключить
+  const screen = h("div", { class: "screen light", "aria-live": "polite" });
+  const themeSeg = segmented([["light", "светлая"], ["dark", "тёмная"]], "light", v => { theme = v; paintTheme(); }, "Тема плашки");
+  const paintTheme = () => { screen.className = "screen " + (theme || "light"); themeSeg.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", b.dataset.v === (theme || "light"))); };
+  // строка «вашей программы»: хвост набранного, курсор и плашка рядом с ним
+  function paintScreen(chip) {
+    if (!ta.value) { put(screen, h("span", { class: "scr-none" }, "Начните печатать — здесь подсказка появится так, как на экране")); return; }
+    const tail = ta.value.split("\n").pop().slice(-60);
+    put(screen, h("span", { class: "scr-typed" }, tail), h("i", { class: "scr-caret", "aria-hidden": "true" }),
+      chip || h("span", { class: "scr-none" }, "  подсказки нет"));
+  }
   const why = h("p", { class: "why" }), metas = h("div", { class: "metas" }), top = h("div", {});
   const llmRes = h("span", { class: "llm-res" });
   const ta = h("textarea", { placeholder: "Привет, как де", maxlength: 2000, "aria-label": "Текст для проверки", spellcheck: "false" });
   const llmBtn = h("button", { class: "btn sm ghost", disabled: true, onclick: askLLM }, "Спросить LLM ✦");
+  let seq = 0;  // ответ на устаревший текст не должен затереть свежий
   async function run() {
+    const my = ++seq;
     llmBtn.disabled = !ta.value.trim();
     llmRes.replaceChildren();
     if (!ta.value) {
-      plate.replaceChildren(hint(), h("kbd", {}, "Tab"));
+      paintScreen();
       why.replaceChildren(); metas.replaceChildren(); top.replaceChildren(); return;
     }
     const r = await act("/api/sandbox", { text: ta.value });
-    if (!r) return;
+    if (!r || my !== seq) return;
+    if (!theme && r.theme) { theme = r.theme; paintTheme(); }
     const s = r.suggestion, e = r.explain;
-    put(plate,
-      h("div", { class: "text" }, h("span", { class: "typed" }, ta.value.slice(-80)), s ? h("span", { class: "ins" }, s.insert) : h("span", { class: "none" }, "  — подсказки нет")),
-      s ? h("kbd", {}, status ? status.key : "Tab") : null);
+    paintScreen(s ? ovChip(s.insert, s.level) : null);
     why.className = "why" + (s ? " ok" : "");
     why.replaceChildren(h("b", {}, s ? "Будет подсказка: " : "Подсказки нет: "), e.why + ".");
     const m = (k, v) => h("span", {}, k + " ", h("b", {}, v));
@@ -843,20 +862,25 @@ async function sandbox() {
       empty("Кандидатов нет", "Модель не знает продолжений для этого контекста."));
   }
   async function askLLM() {
+    const asked = ta.value;
     llmBtn.disabled = true;
     llmRes.replaceChildren(h("span", { class: "muted" }, "думает…"));
-    const r = await act("/api/sandbox/llm", { text: ta.value });
+    const r = await act("/api/sandbox/llm", { text: asked });
+    if (ta.value !== asked) return;  // текст уже другой — ответ к нему не относится, run() всё перерисовал
     llmBtn.disabled = !ta.value.trim();
     if (!r) { llmRes.replaceChildren(); return; }
     if (!r.ready) llmRes.replaceChildren(h("span", { class: "muted" }, "LLM недоступна — " + r.status));
-    else if (r.insert) llmRes.replaceChildren(h("span", { class: "ins" }, r.insert),
-      h("span", { class: "muted" }, ` · вероятность ${pct(r.prob)} при пороге ${pct(r.need)} · ${num(r.ms)} мс`));
-    else llmRes.replaceChildren(h("span", { class: "muted" }, `LLM не уверена: вероятность ниже порога ${pct(r.need)} · ${num(r.ms)} мс`));
+    else if (r.insert) {
+      paintScreen(ovChip(r.insert, "llm"));
+      llmRes.replaceChildren(h("span", { class: "muted" }, `✦ на плашке выше · вероятность ${pct(r.prob)} при пороге ${pct(r.need)} · ${num(r.ms)} мс`));
+    } else llmRes.replaceChildren(h("span", { class: "muted" }, `LLM не уверена: вероятность ниже порога ${pct(r.need)} · ${num(r.ms)} мс`));
   }
   ta.addEventListener("input", debounce(run, 300));
+  paintScreen(); paintTheme();
   view.replaceChildren(
     pageHead("проверка модели", "Песочница", "Что подскажет модель на любой текст и почему. LLM ✦ — по кнопке. Введённое нигде не сохраняется."),
-    h("div", { class: "composer" }, ta, plate), why, metas,
+    h("div", { class: "composer" }, ta, screen,
+      h("div", { class: "screen-bar" }, h("span", { class: "label" }, "так плашка выглядит у курсора"), themeSeg)), why, metas,
     h("div", { class: "llm-ask" }, llmBtn, llmRes),
     sec("Топ-8 кандидатов n-грамм", "по вероятности", top));
   ta.focus();

@@ -399,12 +399,26 @@ table.tbl { border-collapse: collapse; width: 100%; }
 .composer textarea { min-height: 130px; padding: 22px 24px; font: 400 19px/1.55 var(--mono); letter-spacing: -.01em;
                      background: transparent; box-shadow: none; border-radius: 0; resize: none; }
 .composer textarea:focus { box-shadow: none; }
-.plate { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; min-height: 64px;
-         border-top: 1px solid var(--line); background: var(--sunken); }
-.plate .text { font: 400 17px/1.5 var(--mono); word-break: break-word; min-width: 0; }
-.plate .typed { color: var(--muted); white-space: pre-wrap; }
-.plate .ins { color: var(--accent); background: var(--accent-soft); border-radius: 3px; padding: 1px 2px; }
-.plate .none { color: var(--faint); font-family: var(--sans); font-size: 14px; }
+/* превью плашки: «окно вашей программы» в системном шрифте и плашка в цветах overlay.py (LIGHT / DARK) */
+.screen { --ov-bg: #f4f4f4; --ov-fg: #6b6b6b; --ov-hint: #a0a0a0; --ov-border: #c8c8c8; --ov-key: #d2d2d2; --ov-accent: #b06c0b;
+          display: flex; align-items: center; flex-wrap: wrap; row-gap: 6px; padding: 20px 24px; min-height: 68px;
+          border-top: 1px solid var(--line); background: #fff; color: #1b1b1b;
+          font: 400 15px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+.screen.dark { --ov-bg: #2b2b2b; --ov-fg: #c8c8c8; --ov-hint: #7a7a7a; --ov-border: #3c3c3c; --ov-key: #4a4a4a; --ov-accent: #e8a23a;
+               background: #1f1f1f; color: #e6e6e6; }
+.scr-typed { white-space: pre; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.scr-caret { display: inline-block; width: 1px; height: 1.25em; background: currentColor; margin: 0 1px 0 1px; animation: blink 1.1s steps(1) infinite; }
+.scr-none { color: #8a8a8a; font-size: 14px; white-space: pre; }
+.ov { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; padding: 1px 4px; border-radius: 4px; opacity: .93;
+      background: var(--ov-bg); box-shadow: 0 0 0 1px var(--ov-border), 0 6px 16px -6px rgb(0 0 0 / .35); }
+.ov.gap { margin-left: calc(2px + .28em); }  /* ведущий пробел подсказки — отступом, как в overlay.split_lead */
+.ov-t { color: var(--ov-fg); font-size: 16px; }
+.ov-k { color: var(--ov-hint); font-size: 11px; line-height: 1.35; padding: 0 3px; box-shadow: inset 0 0 0 1px var(--ov-key); }
+.ov-m { color: var(--ov-accent); font: 13px/1 "Segoe UI Symbol", "Segoe UI", sans-serif; }
+.screen-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px 8px 24px;
+              border-top: 1px solid var(--line); background: var(--sunken); }
+.screen-bar .seg button { padding-block: 4px; font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .scr-caret { animation: none; } }
 .why { margin-top: 18px; color: var(--muted); text-wrap: pretty; }
 .why b { color: var(--fg); font-weight: 600; }
 .why.ok b { color: var(--accent); }
@@ -483,7 +497,7 @@ dialog.ask .actions { justify-content: flex-end; margin-top: 24px; }
   .f-label::before { left: -11px; }
   .status { grid-template-columns: 1fr; }
   .composer textarea { font-size: 16px; padding: 18px; }
-  .plate { padding: 14px 18px; }
+  .screen { padding: 14px 18px; }
   .p-cell .meter { width: 80px; }
   .tbl th, .tbl td { padding-left: 8px; padding-right: 8px; }
   .tbl td:first-child { white-space: normal; }
