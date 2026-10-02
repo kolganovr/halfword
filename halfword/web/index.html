@@ -3,26 +3,33 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="dark light">
 <meta name="st-token" content="__TOKEN__">
 <title>Halfword — панель</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23171512'/%3E%3Cpath d='M9 8v16M9 16.5c1-2.6 3-4 5.2-4 2.6 0 3.8 1.7 3.8 4.6V24' fill='none' stroke='%23ede6db' stroke-width='2.6' stroke-linecap='round'/%3E%3Crect x='22' y='9' width='2.6' height='15' rx='1.3' fill='%23e8a23a'/%3E%3C/svg%3E">
+<link rel="preload" href="/fonts/onest-cyrillic-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<a class="skip" href="#view">К содержимому</a>
 <header class="top">
-  <div class="brand"><span class="logo">H</span> Halfword</div>
-  <nav id="tabs">
-    <a href="#overview">Обзор</a>
-    <a href="#train">Обучение</a>
-    <a href="#usage">Журнал подсказок</a>
-    <a href="#settings">Настройки</a>
-    <a href="#sandbox">Песочница</a>
-    <a href="#dict">Словарь</a>
-  </nav>
-  <div class="conn" id="conn" title="Связь с программой"><i></i><span>нет связи</span></div>
+  <div class="top-in">
+    <a class="brand" href="#overview" aria-label="Halfword — обзор">half<i class="caret" aria-hidden="true"></i><span class="ghost">word</span></a>
+    <nav id="tabs" aria-label="Разделы">
+      <a href="#overview">обзор</a>
+      <a href="#dict">словарь</a>
+      <a href="#settings">настройки</a>
+      <a href="#usage">журнал</a>
+      <a href="#train">обучение</a>
+      <a href="#sandbox">песочница</a>
+      <span class="nav-ink" aria-hidden="true"></span>
+    </nav>
+    <div class="conn" id="conn" title="Связь с программой"><i></i><span>нет связи</span></div>
+  </div>
 </header>
-<main id="view"></main>
-<div id="toast" role="status" aria-live="polite"></div>
+<main id="view" tabindex="-1"></main>
+<div id="toast" role="status" aria-live="polite"><i></i><span></span></div>
 <script src="/app.js"></script>
 </body>
 </html>

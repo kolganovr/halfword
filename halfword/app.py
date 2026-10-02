@@ -17,7 +17,7 @@ from . import config as C
 from . import panel
 from .caret import CaretLocator
 from .llm import LLM, on_ac_power
-from .model import DOC_WEIGHT, WORD_CH, BaseModel, Predictor, Suggestion, UserModel, parse_context
+from .model import DOC_WEIGHT, WORD_CH, WORD_RE, BaseModel, Predictor, Suggestion, UserModel, parse_context
 from .overlay import Overlay
 from .stats import Stats
 from .trainer import Trainer
@@ -156,7 +156,6 @@ class App:
         self.on_ac = True
         self.power_checked = 0.0
         self.llm_was_ready = False
-        self.stats_win = None
         # трей
         self.pause_until = 0.0    # подсказки на паузе до этого времени (в config.enabled не пишется)
         self.typed_exe = ""       # последняя программа, где печатали (self.exe прыгает на трей при клике)
@@ -165,6 +164,7 @@ class App:
         self._llm_warned = False
         self._icons: dict = {}
         self._icon_state = None
+        self._menu_key = None
 
     def _apply_predictor_cfg(self):
         """Пороги и переключатели предсказателя из config (при запуске и после правки в панели)."""
@@ -502,8 +502,17 @@ class App:
         self.llm.request(seq, self.buf, prefix, self.cfg.llm_min_prob, self.cfg.llm_max_words, cb,
                          self._header())
 
+    def _banned_in(self, r) -> bool:
+        """В ответе LLM запрещённое слово (Словарь → «Запрещённые»): недописанное слово перед курсором + вставка."""
+        if not self.predictor.banned:
+            return False
+        tail = re.search(r"\S*$", r.text).group(0)
+        return any(w in self.predictor.banned for w in WORD_RE.findall((tail + r.insert).lower()))
+
     def _on_llm(self, r, off: int = 0):
         r.off = off
+        if self._banned_in(r):
+            return
         self.llm_res = r
         if DEBUG:
             log.debug("LLM %.0f мс → %r p=%.2f", self.llm.last_ms, r.insert, r.prob)
@@ -535,6 +544,11 @@ class App:
             return  # текст уже другой
         if self.variants and (self.variants[0].off, self.variants[0].text) != (r.off, r.text):
             self.variants, self.vi = [], 0  # ответ на новый текст вытесняет старые варианты
+        if self._banned_in(r):  # вариант дорос до запрещённого слова — убираем его
+            self.variants = [v for v in self.variants if v.variant != r.variant]
+            self.vi = min(self.vi, max(0, len(self.variants) - 1))
+            self._refresh(self.last_seq)
+            return
         for i, v in enumerate(self.variants):
             if v.variant == r.variant:
                 self.variants[i] = r
@@ -621,8 +635,7 @@ class App:
         self.cfg.llm_enabled = not self.cfg.llm_enabled
         self.cfg.save()
         self._manage_llm(refresh_power=True)
-        if self.tray:
-            self.tray.update_menu()
+        self._refresh_tray()
 
     def _show(self, s, x, y, h, seq):
         long = s.level == "long"
@@ -747,8 +760,7 @@ class App:
         self._reset_buf()
         self._hide()
         log.info("подсказки %s", "включены" if on else "выключены")
-        if self.tray:
-            self.tray.update_menu()
+        self._refresh_tray()
 
     # --- обучение: считает дочерний процесс, здесь только запуск и подмена модели ---
     def _retrain(self) -> bool:
@@ -843,47 +855,10 @@ class App:
 
         threading.Thread(target=work, daemon=True, name="corpus-check").start()
 
-    def _show_stats(self):
-        self._text_window("Halfword — статистика", self.stats.report(), ("Segoe UI", 11))
-
-    def _show_usage(self):
-        from . import usage
-        self.usage.flush()
-        text = usage.report(usage.load(C.USAGE_FILE, 7)) + "\n\n(за 7 дней; за всё время — python -m halfword usage)"
-        self._text_window("Halfword — журнал подсказок", text, ("Consolas", 10))
-
-    def _text_window(self, title: str, text: str, font):
-        if self.stats_win is not None and self.stats_win.winfo_exists():
-            self.stats_win.destroy()
-        w = tk.Toplevel(self.root)
-        w.title(title)
-        w.attributes("-topmost", True)
-        w.resizable(False, False)
-        tk.Label(w, text=text, justify="left", font=font, padx=16, pady=12).pack()
-        tk.Button(w, text="Закрыть", command=w.destroy, padx=12).pack(pady=(0, 12))
-        self.stats_win = w
-
     # --- трей ---
     STAGE_NAMES = {"start": "запуск", "notes": "Тексты", "telegram": "Telegram",
                    "claude": "Claude", "count": "Подсчёт слов", "prune": "Отсев", "write": "Запись",
                    "check": "Проверка"}
-
-    def _make_icons(self):
-        """Иконки по состоянию заранее: основа (вкл/выкл/программа в чёрном списке) × точка (обучение/LLM грузится)."""
-        from PIL import Image, ImageDraw
-        base_col = {"on": (40, 90, 200, 255), "off": (130, 130, 130, 255), "blocked": (130, 130, 130, 255)}
-        dot_col = {None: None, "train": (245, 200, 40, 255), "llm": (90, 200, 240, 255)}
-        for b, bc in base_col.items():
-            for dot, dc in dot_col.items():
-                img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-                d = ImageDraw.Draw(img)
-                d.rounded_rectangle((4, 4, 60, 60), 12, fill=bc)
-                d.text((19, 6), "T", fill="white", font_size=44)
-                if b == "blocked":
-                    d.line((10, 54, 54, 10), fill=(240, 140, 30, 255), width=7)
-                if dc:
-                    d.ellipse((36, 36, 62, 62), fill=dc, outline="white", width=3)
-                self._icons[(b, dot)] = img
 
     def _tray_state(self) -> tuple:
         if not self.shared.enabled:
@@ -900,15 +875,30 @@ class App:
             dot = None
         return base, dot
 
+    def _menu_state(self) -> tuple:
+        """Всё, из чего собраны подписи меню: pystray на Windows перестраивает меню только по update_menu()."""
+        return (self._state_line(), self._llm_status(),
+                self.trainer.state["running"] and self._train_status(),
+                self.typed_exe, self.llm.available, self.llm_installing, self.cfg.llm_enabled)
+
     def _refresh_tray(self):
-        """Иконку и подсказку меняем только при смене состояния."""
+        """Иконку, подсказку и меню трогаем только при смене состояния."""
         if not self.tray or not self._icons:
             return
-        key = self._tray_state()
-        if key == self._icon_state:
+        key, menu = self._tray_state(), self._menu_state()
+        if key == self._icon_state and menu == self._menu_key:
             return
-        self._icon_state = key
-        base, dot = key
+        self._menu_key = menu
+        try:
+            if key != self._icon_state:
+                self._icon_state = key
+                self.tray.icon = self._icons[key]
+                self.tray.title = self._tray_title(*key)
+            self.tray.update_menu()
+        except Exception:
+            log.exception("не обновил трей")
+
+    def _tray_title(self, base: str, dot: str | None) -> str:
         title = "Halfword: подсказки при наборе"
         if self.pause_until:
             title += f" (пауза до {time.strftime('%H:%M', time.localtime(self.pause_until))})"
@@ -918,12 +908,9 @@ class App:
             title += f" (выключено в {self.typed_exe})"
         if dot == "train":
             title += ", идёт переобучение"
-        try:
-            self.tray.icon = self._icons[key]
-            self.tray.title = title
-            self.tray.update_menu()
-        except Exception:
-            log.exception("не обновил иконку трея")
+        elif dot == "llm":
+            title += ", загружается ИИ"
+        return title
 
     def _notify(self, text: str):
         if not self.tray:
@@ -998,46 +985,50 @@ class App:
         name = self.STAGE_NAMES.get(st["stage"], st["label"])
         return f"Переобучение: {name}, {st['pct']}%…"
 
-    @staticmethod
-    def _has_prev_model() -> bool:
-        return C.BASE_MODEL.with_name(C.BASE_MODEL.stem + ".prev" + C.BASE_MODEL.suffix).exists()
+    def _state_line(self) -> str:
+        """Первая строка меню: что сейчас с подсказками."""
+        if self.pause_until:
+            return "Пауза до " + time.strftime("%H:%M", time.localtime(self.pause_until))
+        if not self.shared.enabled:
+            return "Подсказки выключены"
+        if self.typed_exe and self.typed_exe in self.cfg.blacklist:
+            return f"Выключено в {self.typed_exe}"
+        return "Подсказки работают"
 
     def _start_tray(self):
         try:
             import pystray
-            import PIL  # noqa: F401
+            from . import icon
         except ImportError:
-            log.warning("pystray не установлен — без иконки в трее")
+            log.warning("pystray/Pillow не установлены — без иконки в трее")
             return
-        self._make_icons()
-        M = pystray.MenuItem
+        self._icons = icon.all_states()
+        M, SEP = pystray.MenuItem, pystray.Menu.SEPARATOR
+        put = lambda f: (lambda: self.cmds.put(f))
         running = lambda _: self.trainer.state["running"]
         menu = pystray.Menu(
-            M("Подсказки включены", lambda: self.cmds.put(lambda: self._set_enabled(not self.shared.enabled)),
-              checked=lambda _: self.shared.enabled),
-            M(lambda _: ("Пауза до " + time.strftime("%H:%M", time.localtime(self.pause_until)))
-              if self.pause_until else "Пауза на 1 час", lambda: self.cmds.put(self._toggle_pause)),
-            M(lambda _: ("Включить в " if self.typed_exe in self.cfg.blacklist else "Выключить в ") + self.typed_exe,
-              lambda: self.cmds.put(self._toggle_exe), visible=lambda _: bool(self.typed_exe)),
-            M("Открыть панель…", self._open_panel, default=self.panel is not None,
-              visible=lambda _: self.panel is not None),
-            M("Статистика…", lambda: self.cmds.put(self._show_stats), default=self.panel is None),
-            M("Журнал подсказок…", lambda: self.cmds.put(self._show_usage)),
+            # клик по иконке — панель; пункт по умолчанию показан жирным
+            M("Открыть панель", lambda: self._open_panel(), default=True, enabled=lambda _: self.panel is not None),
+            # строки состояния — серые, без действия
+            M(lambda _: self._state_line(), None, enabled=False),
             M(lambda _: self._llm_status(), None, enabled=False),
-            M("Установить ИИ-модель…", lambda: self.cmds.put(self._install_llm),
-              visible=lambda _: not self.llm.available and not self.llm_installing),
-            M("LLM на зарядке", lambda: self.cmds.put(self._toggle_llm),
-              checked=lambda _: self.cfg.llm_enabled),
             M(lambda _: self._train_status(), None, enabled=False, visible=running),
-            M("Переобучить", lambda: self.cmds.put(self._retrain),
-              enabled=lambda _: not self.trainer.state["running"]),
+            SEP,
+            M("Подсказки", put(lambda: self._set_enabled(not self.shared.enabled)),
+              checked=lambda _: self.shared.enabled and not self.pause_until),
+            M(lambda _: "Снять паузу" if self.pause_until else "Пауза на 1 час", put(self._toggle_pause)),
+            M(lambda _: ("Включить в " if self.typed_exe in self.cfg.blacklist else "Выключить в ") + self.typed_exe,
+              put(self._toggle_exe), visible=lambda _: bool(self.typed_exe)),
+            SEP,
+            M("ИИ-подсказки ✦", put(self._toggle_llm), checked=lambda _: self.cfg.llm_enabled,
+              visible=lambda _: self.llm.available),
+            M("Установить ИИ-модель…", put(self._install_llm),
+              visible=lambda _: not self.llm.available and not self.llm_installing),
+            M("Переобучить сейчас", put(self._retrain), visible=lambda _: not self.trainer.state["running"]),
             M("Отменить переобучение", lambda: self.trainer.cancel(), visible=running),
-            M("Применить отложенную модель", lambda: self.cmds.put(self._train_apply),
-              visible=lambda _: self.trainer.state["pending"] and not self.trainer.state["running"]),
-            M("Откатить модель", lambda: self.cmds.put(self._train_rollback),
-              visible=lambda _: self._has_prev_model() and not self.trainer.state["running"]),
-            M("Открыть папку данных", lambda: os.startfile(C.DATA_DIR)),
-            M("Выход", lambda: self.cmds.put(self.root.quit)),
+            SEP,
+            M("Папка данных", lambda: os.startfile(C.DATA_DIR)),
+            M("Выход", put(lambda: self.root.quit())),
         )
         self._icon_state = self._tray_state()
         self.tray = pystray.Icon("halfword", self._icons[self._icon_state], "Halfword: подсказки при наборе", menu)
@@ -1045,9 +1036,10 @@ class App:
         if self.cfg.llm_enabled and not self.llm.available:
             self._notify("ИИ-подсказки ✦ не установлены: трей → «Установить ИИ-модель…»")
 
-    def _open_panel(self):
+    def _open_panel(self, tab: str = ""):
+        """Панель в браузере; tab — вкладка (overview, usage, train, settings…)."""
         if self.panel:
-            webbrowser.open(self.panel.url)
+            webbrowser.open(self.panel.url + ("#" + tab if tab else ""))
 
     def _shutdown(self):
         if self.panel:

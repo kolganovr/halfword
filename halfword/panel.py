@@ -25,12 +25,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import config as C
-from .model import WORD_RE, parse_context
+from .model import NUM, WORD_RE, parse_context
 
 log = logging.getLogger("halfword.panel")
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 STATIC = {"/app.js": "application/javascript; charset=utf-8", "/style.css": "text/css; charset=utf-8"}
+FONTS = [f"/fonts/{n}-{s}-wght-normal.woff2" for n in ("onest", "jetbrains-mono") for s in ("latin", "cyrillic")]
+STATIC.update({f: "font/woff2" for f in FONTS})  # шрифты не меняются между версиями — их можно кешировать
 MAX_BODY = 64 * 1024
 PORT_TRIES = 8          # panel_port, +1 … +7
 CALL_TIMEOUT = 2.0
@@ -80,42 +82,57 @@ def _s(key, group, label, hint, type_, **kw):
 
 
 MORE = "Ниже — подсказки чаще, но больше мимо; выше — реже и точнее."
+ADV = {"adv": True}        # расширенная: в панели спрятана под «Расширенные»
+TRAIN = {"tab": "train"}   # показывается во вкладке «Обучение», а не в «Настройках»
 SETTINGS = [
-    _s("min_conf_word", "Пороги n-грамм", "Уверенность: дописать слово", MORE, "float", min=0.05, max=0.95, step=0.01),
-    _s("min_conf_next", "Пороги n-грамм", "Уверенность: следующее слово после пробела", MORE, "float", min=0.05, max=0.95, step=0.01),
+    _s("min_conf_word", "Пороги n-грамм", "Уверенность: дописать слово", MORE, "float", min=0.05, max=0.95, step=0.01, **ADV),
+    _s("min_conf_next", "Пороги n-грамм", "Уверенность: следующее слово после пробела", MORE, "float", min=0.05, max=0.95, step=0.01, **ADV),
     _s("min_support", "Пороги n-грамм", "Минимум встреч пары/тройки слов",
-       "Меньше — чаще, но на случайных парах; больше — только устойчивые фразы.", "int", min=1, max=20),
-    _s("short_penalty", "Пороги n-грамм", "Надбавка к порогу за короткий префикс",
-       "За каждый символ короче 4 порог растёт на столько: больше — меньше подсказок на 1–2 буквах.", "float", min=0.0, max=0.3, step=0.01),
+       "Меньше — чаще, но на случайных парах; больше — только устойчивые фразы.", "int", min=1, max=20, **ADV),
+    _s("short_penalty", "Пороги n-грамм", "Надбавка к порогу за короткое начало слова",
+       "За каждую букву короче 4 порог растёт на столько: больше — меньше подсказок на 1–2 буквах.", "float", min=0.0, max=0.3, step=0.01, **ADV),
     _s("min_insert_chars", "Точность", "Минимальная длина подсказки (символов)",
-       "Короче не показываем: Tab ради 1–2 букв не жмут. Меньше — чаще, больше — точнее.", "int", min=1, max=10),
+       "Короче не показываем: Tab ради 1–2 букв не жмут. Меньше — чаще, больше — точнее.", "int", min=1, max=10, **ADV),
     _s("fast_typing_ms", "Точность", "«Быстрый набор»: средняя пауза, мс",
-       "Если пауза между нажатиями меньше — набор считается быстрым и подсказки строже.", "int", min=30, max=400),
+       "Если пауза между нажатиями меньше — набор считается быстрым и подсказки строже.", "int", min=30, max=400, **ADV),
     _s("fast_min_insert", "Точность", "Минимальная длина подсказки на быстром наборе",
-       "Больше — меньше помех при беглом наборе, но реже подсказки.", "int", min=1, max=15),
-    _s("doc_cache", "Точность", "Слова из текущего поля", "Слова и пары из того, что уже написано в поле, весят больше.", "bool"),
-    _s("layout_fix", "Точность", "Исправлять раскладку", "«ghbdtn» → «привет»: подсказка при не той раскладке.", "bool"),
+       "Больше — меньше помех при беглом наборе, но реже подсказки.", "int", min=1, max=15, **ADV),
+    _s("doc_cache", "Точность", "Слова из текущего поля", "Слова и пары из того, что уже написано в поле, весят больше.", "bool", **ADV),
+    _s("layout_fix", "Общее", "Исправлять раскладку", "«ghbdtn» → «привет»: подсказка при не той раскладке.", "bool"),
     _s("learn", "Общее", "Дообучаться на наборе", "Запоминать слова, набранные руками (кроме паролей и чёрного списка).", "bool"),
-    _s("accept_key", "Общее", "Клавиша принятия", "Tab или стрелка вправо.", "enum", choices=["tab", "right"]),
-    _s("overlay_theme", "Общее", "Тема плашки", "auto — как в Windows.", "enum", choices=["auto", "light", "dark"]),
+    _s("accept_key", "Общее", "Клавиша принятия", "Tab или стрелка вправо.", "enum", choices=["tab", "right"],
+       names={"tab": "Tab", "right": "→ стрелка вправо"}),
+    _s("overlay_theme", "Общее", "Тема плашки", "Авто — как в Windows.", "enum", choices=["auto", "light", "dark"],
+       names={"auto": "авто", "light": "светлая", "dark": "тёмная"}),
     _s("llm_enabled", "LLM ✦", "LLM включена", "Языковая модель дописывает слова и фразы.", "bool"),
     _s("llm_only_on_ac", "LLM ✦", "Только на зарядке", "На батарее сервер модели выгружается.", "bool"),
-    _s("llm_min_prob", "LLM ✦", "Порог вероятности LLM", MORE.replace("n-грамм", "LLM"), "float", min=0.1, max=0.95, step=0.01),
-    _s("llm_max_words", "LLM ✦", "Слов в короткой подсказке", "Больше слов — длиннее, но чаще мимо.", "int", min=1, max=10),
-    _s("llm_delay_ms", "LLM ✦", "Пауза до запроса, мс", "Меньше — быстрее ответ, но больше лишних запросов.", "int", min=0, max=1000),
-    _s("llm_pause_ms", "LLM ✦", "Пауза до длинной подсказки ✦✦, мс", "Через сколько после остановки печати предлагать продолжение.", "int", min=200, max=3000),
-    _s("llm_long_words", "LLM ✦", "Слов в длинной подсказке ✦✦", "Максимум слов продолжения в паузе.", "int", min=3, max=40),
-    _s("llm_variants", "LLM ✦", "Вариантов длинной подсказки", "Переключаются Alt+↓/↑; больше — дольше считается.", "int", min=1, max=5),
     _s("llm_after_enter", "LLM ✦", "Подсказывать с новой строки", "Длинная подсказка в начале строки после Enter.", "bool"),
     _s("llm_header", "LLM ✦", "Передавать заголовок окна", "Название программы и окна первой строкой промпта: точнее, но модель видит заголовок.", "bool"),
+    _s("llm_min_prob", "LLM ✦", "Порог вероятности LLM", MORE.replace("n-грамм", "LLM"), "float", min=0.1, max=0.95, step=0.01, **ADV),
+    _s("llm_max_words", "LLM ✦", "Слов в короткой подсказке", "Больше слов — длиннее, но чаще мимо.", "int", min=1, max=10, **ADV),
+    _s("llm_delay_ms", "LLM ✦", "Пауза до запроса, мс", "Меньше — быстрее ответ, но больше лишних запросов.", "int", min=0, max=1000, **ADV),
+    _s("llm_pause_ms", "LLM ✦", "Пауза до длинной подсказки ✦✦, мс", "Через сколько после остановки печати предлагать продолжение.", "int", min=200, max=3000, **ADV),
+    _s("llm_long_words", "LLM ✦", "Слов в длинной подсказке ✦✦", "Максимум слов продолжения в паузе.", "int", min=3, max=40, **ADV),
+    _s("llm_variants", "LLM ✦", "Вариантов длинной подсказки", "Переключаются Alt+↓/↑; больше — дольше считается.", "int", min=1, max=5, **ADV),
     _s("text_dirs", "Обучение", "Папки с вашими текстами",
        "По одной на строку: заметки, документы, черновики — файлы .md и .txt, вложенные папки тоже. "
-       "Применится при следующем обучении.", "paths"),
-    _s("train_auto", "Обучение", "Переобучать автоматически", "Раз в сутки на зарядке и в простое, если корпус изменился.", "bool"),
+       "Применится при следующем обучении.", "paths", **TRAIN),
+    _s("train_auto", "Обучение", "Переобучать автоматически", "Раз в сутки на зарядке и в простое, если тексты изменились.", "bool", **TRAIN),
+    _s("tg_weight", "Обучение", "Вес Telegram", "Множитель веса ваших сообщений; 0 — не брать. Применится при следующем обучении.",
+       "float", min=0.0, max=20.0, step=0.5, **TRAIN),
+    _s("claude_weight", "Обучение", "Вес сообщений Claude Code", "0 — не брать. Применится при следующем обучении.",
+       "float", min=0.0, max=20.0, step=0.5, **TRAIN),
     _s("train_gate_pp", "Обучение", "Допуск потери экономии, п.п.",
-       "Новая модель хуже прежней больше чем на столько — не подменяет её.", "float", min=0.0, max=5.0, step=0.1),
-    _s("tg_weight", "Обучение", "Вес Telegram", "Множитель веса ваших сообщений. Применится при следующем обучении.", "float", min=0.0, max=20.0, step=0.5),
-    _s("claude_weight", "Обучение", "Вес сообщений Claude Code", "0 — не брать. Применится при следующем обучении.", "float", min=0.0, max=20.0, step=0.5),
+       "Новая модель хуже прежней больше чем на столько — не подменяет её.", "float", min=0.0, max=5.0, step=0.1, **TRAIN, **ADV),
+]
+# частота подсказок одним переключателем: «как по умолчанию» — значения Config
+PRESET_KEYS = ("min_conf_word", "min_conf_next", "min_support", "short_penalty", "min_insert_chars", "llm_min_prob")
+PRESETS = [
+    {"key": "rare", "name": "реже и точнее", "values": dict(min_conf_word=0.45, min_conf_next=0.55, min_support=3,
+                                                           short_penalty=0.1, min_insert_chars=3, llm_min_prob=0.55)},
+    {"key": "default", "name": "по умолчанию", "values": None},
+    {"key": "often", "name": "чаще", "values": dict(min_conf_word=0.25, min_conf_next=0.3, min_support=2,
+                                                   short_penalty=0.05, min_insert_chars=2, llm_min_prob=0.3)},
 ]
 SETTINGS_BY_KEY = {s["key"]: s for s in SETTINGS}
 # какие ключи cfg уходят в App.llm.configure (имена — как в App.__init__)
@@ -196,8 +213,10 @@ def apply_config(app, changes: dict) -> dict:
 
 
 def settings_payload(app) -> dict:
-    cfg = app.cfg
-    return {"schema": SETTINGS, "values": {s["key"]: getattr(cfg, s["key"], None) for s in SETTINGS}}
+    cfg, dflt = app.cfg, C.Config()
+    presets = [dict(p, values=p["values"] or {k: getattr(dflt, k) for k in PRESET_KEYS}) for p in PRESETS]
+    return {"schema": SETTINGS, "values": {s["key"]: getattr(cfg, s["key"], None) for s in SETTINGS},
+            "defaults": {s["key"]: getattr(dflt, s["key"], None) for s in SETTINGS}, "presets": presets}
 
 
 # --- чёрный список ---
@@ -219,7 +238,19 @@ def set_blacklist(app, names) -> list[str]:
     app.cfg.blacklist = out
     app.cfg.save()
     app.blocked = getattr(app, "exe", "") in out
+    if hasattr(app, "_refresh_tray"):  # иконка трея показывает, что программа в чёрном списке
+        app._icon_state = None
+        app._refresh_tray()
     return out
+
+
+def block_exe(app, exe, on) -> list[str]:
+    """Добавить программу в чёрный список или убрать из него. ГЛАВНЫЙ ПОТОК."""
+    if not isinstance(exe, str) or not exe.strip() or not isinstance(on, bool):
+        raise PanelError("нужны exe и on: true/false")
+    exe = exe.strip().lower()
+    bl = [x for x in app.cfg.blacklist if x != exe]
+    return set_blacklist(app, bl + [exe] if on else bl)
 
 
 # --- словарь, запрещённые слова, сниппеты ---
@@ -270,7 +301,7 @@ def snippets_edit(app, body: dict) -> dict:
             raise PanelError("delete: нужна строка")
         sn.pop(body["delete"], None)
     else:
-        abbr, text = body.get("abbr"), body.get("text")
+        abbr, text, old = body.get("abbr"), body.get("text"), body.get("old")
         if not isinstance(abbr, str) or not isinstance(text, str):
             raise PanelError("нужны abbr и text")
         abbr = abbr.strip()
@@ -278,6 +309,8 @@ def snippets_edit(app, body: dict) -> dict:
             raise PanelError("сокращение: 1–40 символов без пробелов")
         if not text.strip() or len(text) > 2000:
             raise PanelError("текст: от 1 до 2000 символов")
+        if isinstance(old, str) and old != abbr:  # правка с новым сокращением
+            sn.pop(old, None)
         sn[abbr] = text
     app.cfg.snippets = sn
     app.cfg.save()
@@ -287,8 +320,73 @@ def snippets_edit(app, body: dict) -> dict:
 
 
 # --- песочница ---
+LEVEL_NAMES = {"tri": "по предыдущим словам", "uni": "по частоте слова", "stem": "общая основа слов",
+               "snippet": "сниппет", "layout": "исправление раскладки"}
+
+
+def _pct(x: float) -> str:
+    return f"{x * 100:.0f}%"
+
+
+def explain(p, text: str, s) -> dict:
+    """Почему n-граммы подсказали или промолчали: повторяет проверки Predictor.suggest по шагам.
+
+    → {"why": фраза для человека, "conf": уверенность лидера, "need": порог} (conf/need — None, если не про порог).
+    """
+    c2, c1, prefix, _start, ends_space = parse_context(text)
+    out = {"why": "", "conf": None, "need": None}
+    if prefix:
+        need = p.min_conf_word + max(0, 4 - len(prefix)) * p.short_penalty
+    else:
+        need = p.min_conf_next
+    if s is not None:
+        if s.level in ("snippet", "layout"):
+            out["why"] = "сработал сниппет" if s.level == "snippet" else "набрано в другой раскладке"
+            return out
+        if s.level == "stem":  # лидер не дотянул до порога — дописываем общее начало вариантов
+            dist = p.distribution(c2, c1, prefix)[0]
+            lead = dist[0][1] if dist else 0.0
+            out.update(conf=lead, need=need)
+            out["why"] = (f"уверенность лидера {_pct(lead)} ниже порога {_pct(need)}, но варианты начинаются одинаково "
+                          f"(вместе {_pct(s.confidence)}) — дописываем общее начало")
+            return out
+        out.update(conf=s.confidence, need=need)
+        out["why"] = f"уверенность {_pct(s.confidence)} не ниже порога {_pct(need)}"
+        return out
+    if not text.strip():
+        out["why"] = "пустой текст"
+        return out
+    if prefix and (prefix[-1] in "-'’" or prefix.isdigit()):
+        out["why"] = "число или слово с дефисом — не подсказываем"
+        return out
+    if not prefix and not ends_space:
+        out["why"] = "после знака препинания без пробела — ждём пробел или букву"
+        return out
+    dist, sup, sup3 = p._dist(c2, c1, prefix)
+    if not dist:
+        out["why"] = "модель не знает слов с таким началом" if prefix else "модель не знает, что бывает после этих слов"
+        return out
+    w, pr = dist[0]
+    out.update(conf=pr, need=need)
+    if w == prefix.lower():
+        out["why"] = "слово уже дописано"
+    elif not prefix and w == NUM:
+        out["why"] = "следующим было бы число — числа не подсказываем"
+    elif not prefix and sup.get(w, 0) < p.min_support:
+        out["why"] = f"«{p.surface(w)}» встречалось после этих слов {sup.get(w, 0)} раз — нужно не меньше {p.min_support}"
+    elif not prefix and sup3.get(w, 0) < p.next_min_tri:
+        out["why"] = (f"«{p.surface(w)}» после двух последних слов встречалось {sup3.get(w, 0)} раз — "
+                      f"для слова до начала набора нужно не меньше {p.next_min_tri}")
+    elif pr < need:
+        short = " (порог выше: начало слова короче 4 букв)" if prefix and len(prefix) < 4 and p.short_penalty else ""
+        out["why"] = f"уверенность {_pct(pr)} ниже порога {_pct(need)}{short}"
+    else:
+        out["why"] = f"подсказка короче минимальной длины ({p.min_insert} симв.)"
+    return out
+
+
 def sandbox(app, text: str) -> dict:
-    """Что подскажет n-граммная модель на этот текст (LLM не участвует). ГЛАВНЫЙ ПОТОК."""
+    """Что подскажет n-граммная модель на этот текст и почему. ГЛАВНЫЙ ПОТОК."""
     p = app.predictor
     t0 = time.perf_counter()
     s = p.suggest(text)
@@ -296,9 +394,40 @@ def sandbox(app, text: str) -> dict:
     c2, c1, prefix, _start, _sp = parse_context(text)
     dist, sup = p.distribution(c2, c1, prefix)
     return {"suggestion": None if not s else {"insert": s.insert, "word": s.word, "level": s.level,
+                                               "level_name": LEVEL_NAMES.get(s.level, s.level),
                                                "confidence": round(s.confidence, 3), "whole_word": s.whole_word},
+            "explain": explain(p, text, s),
             "ms": round(ms, 2), "context": {"c2": c2, "c1": c1, "prefix": prefix},
             "top": [{"word": p.surface(w), "p": round(pr, 4), "support": sup.get(w, 0)} for w, pr in dist[:8]]}
+
+
+LLM_SANDBOX_WAIT = 8.0
+
+
+def sandbox_llm(app, text: str) -> dict:
+    """Короткая подсказка LLM ✦ на текст Песочницы. Ждём в потоке сервера, главный цикл не держим."""
+    llm = app.llm
+
+    def ask():
+        if not getattr(llm, "ready", False):
+            return None
+        _c2, _c1, prefix, _start, _sp = parse_context(text)
+        llm.request(-1, text, prefix, app.cfg.llm_min_prob, app.cfg.llm_max_words,
+                    lambda r: (box.update(r=r), done.set()))
+        return True
+
+    box: dict = {}
+    done = threading.Event()
+    if not call_main(app, ask):
+        return {"ready": False, "status": call_main(app, app._llm_status)}
+    t0 = time.perf_counter()
+    done.wait(LLM_SANDBOX_WAIT)
+    ms = round((time.perf_counter() - t0) * 1000)
+    r = box.get("r")
+    need = app.cfg.llm_min_prob
+    if r is None:  # ответ ниже порога LLM не присылает
+        return {"ready": True, "insert": None, "need": need, "ms": ms}
+    return {"ready": True, "insert": r.insert, "prob": round(r.prob, 3), "need": need, "ms": ms}
 
 
 # --- статус ---
@@ -336,8 +465,17 @@ def train_state(app) -> dict | None:
 def build_status(app) -> dict:
     """Лёгкий статус для вкладки «Обзор» и SSE. ГЛАВНЫЙ ПОТОК."""
     t = app.stats.summary(1)
-    st = {"enabled": bool(app.shared.enabled), "llm_enabled": bool(app.cfg.llm_enabled),
-          "llm_status": app._llm_status(), "mem_mb": process_memory_mb(),
+    llm = app.llm
+    exe = getattr(app, "typed_exe", "") or ""
+    st = {"enabled": bool(app.shared.enabled), "cfg_enabled": bool(getattr(app.cfg, "enabled", True)),
+          "pause_until": getattr(app, "pause_until", 0.0) or 0.0,
+          "llm_enabled": bool(app.cfg.llm_enabled), "llm_status": app._llm_status(),
+          "llm_ready": bool(getattr(llm, "ready", False)), "llm_ms": round(getattr(llm, "last_ms", 0) or 0),
+          "on_ac": bool(getattr(app, "on_ac", True)), "llm_only_on_ac": bool(app.cfg.llm_only_on_ac),
+          "key": getattr(app, "key_hint", "Tab"), "mem_mb": process_memory_mb(),
+          # последняя программа, где печатали: из панели «выключить здесь» и «почему тут не подсказывает»
+          "exe": exe, "exe_blocked": exe in app.cfg.blacklist,
+          "exe_no_caret": app.stats.no_caret_apps(1).get(exe, 0) if exe else 0,
           "today": {k: t[k] for k in ("shown", "accepted", "saved")}}
     tr = train_state(app)
     if tr is not None:
@@ -484,6 +622,19 @@ class PanelServer:
                     app._toggle_llm()
                 return build_status(app)
             return call_main(app, f)
+        if path == "/api/pause":
+            on = _flag(body)
+
+            def f():
+                if not hasattr(app, "_toggle_pause"):
+                    raise PanelError("пауза недоступна в этой сборке", 501)
+                if bool(getattr(app, "pause_until", 0)) != on:
+                    app._toggle_pause()
+                return build_status(app)
+            return call_main(app, f)
+        if path == "/api/blacklist/exe":
+            exe, on = body.get("exe"), body.get("on")
+            return {"blacklist": call_main(app, lambda: block_exe(app, exe, on))}
         if path.startswith("/api/train/"):
             name = path.rsplit("/", 1)[1]
             if name not in ("start", "cancel", "apply", "rollback"):
@@ -507,6 +658,11 @@ class PanelServer:
             if not isinstance(text, str):
                 raise PanelError("нужен text")
             return call_main(app, lambda: sandbox(app, text[-SANDBOX_MAX:]))
+        if path == "/api/sandbox/llm":
+            text = body.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise PanelError("нужен text")
+            return sandbox_llm(app, text[-SANDBOX_MAX:])
         if path == "/api/dict/forget":
             w = _word(body)
             return {"removed": call_main(app, lambda: dict_forget(app, w))}
@@ -542,11 +698,11 @@ def _make_handler(panel: PanelServer):
             pass
 
         # --- ответы ---
-        def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
+        def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None, cache: str = "no-store"):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             for k, v in (extra or {}).items():
@@ -627,7 +783,8 @@ def _make_handler(panel: PanelServer):
                 return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
             if u.path in STATIC:
                 try:
-                    return self._send(200, (WEB_DIR / u.path[1:]).read_bytes(), STATIC[u.path])
+                    return self._send(200, (WEB_DIR / u.path[1:]).read_bytes(), STATIC[u.path],
+                                      cache="max-age=31536000, immutable" if u.path in FONTS else "no-store")
                 except OSError:
                     return self._fail(404, "нет файла")
             if u.path == "/api/events":

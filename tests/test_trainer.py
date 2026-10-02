@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from halfword import config as C
+from halfword import icon
 from halfword import trainer as T
 
 TERMINAL = ("done", "error", "cancelled")
@@ -214,7 +215,7 @@ class AppTrayTest(unittest.TestCase):
         me.typed_exe, me.exe, me.blocked = "notepad.exe", "notepad.exe", False
         me._tick_at = me._train_check = 0.0
         me._llm_warned = False
-        me._icons, me._icon_state = {}, None
+        me._icons, me._icon_state, me._menu_key = {}, None, None
         me.usage = SimpleNamespace(reset=lambda *a: None)
         me.on_ac, me.last_key = True, 0.0
         return me
@@ -259,20 +260,47 @@ class AppTrayTest(unittest.TestCase):
 
     def test_icon_changes_only_on_state_change(self):
         me = self.make()
-        me._make_icons()
+        me._icons = icon.all_states()
         self.assertEqual(len(me._icons), 9)
-        icon = SimpleNamespace()
-        icon.update_menu = mock.Mock()
-        me.tray = icon
+        tray = SimpleNamespace()
+        tray.update_menu = mock.Mock()
+        me.tray = tray
         me._refresh_tray()
-        first = icon.icon
-        icon.update_menu.reset_mock()
+        first = tray.icon
+        tray.update_menu.reset_mock()
         me._refresh_tray()
-        icon.update_menu.assert_not_called()
+        tray.update_menu.assert_not_called()
         me.trainer.state["running"] = True
         me._refresh_tray()
-        self.assertIsNot(icon.icon, first)
-        self.assertIn("переобучение", icon.title)
+        self.assertIsNot(tray.icon, first)
+        self.assertIn("переобучение", tray.title)
+
+    def test_menu_follows_status(self):
+        """Меню pystray статично: смена строки статуса без смены иконки тоже его перестраивает."""
+        me = self.make()
+        me._icons = icon.all_states()
+        me.tray = SimpleNamespace(update_menu=mock.Mock())
+        me._refresh_tray()
+        me.tray.update_menu.reset_mock()
+        me.llm.ready = me.llm.running = True
+        me._refresh_tray()
+        me.tray.update_menu.assert_called_once()
+        self.assertEqual(me._llm_status(), "LLM: работает ✦")
+
+    def test_icon_states(self):
+        st = icon.all_states()
+        self.assertEqual({k[0] for k in st}, {"on", "off", "blocked"})
+        self.assertTrue(all(im.size == (icon.SIZE, icon.SIZE) and im.mode == "RGBA" for im in st.values()))
+        self.assertNotEqual(st[("on", None)].tobytes(), st[("off", None)].tobytes())
+
+    def test_open_panel_tab(self):
+        me = self.make()
+        me.panel = SimpleNamespace(url="http://127.0.0.1:1/?t=x")
+        with mock.patch("webbrowser.open") as op:
+            me._open_panel("usage")
+            me._open_panel()
+        self.assertEqual([c.args[0] for c in op.call_args_list],
+                         ["http://127.0.0.1:1/?t=x#usage", "http://127.0.0.1:1/?t=x"])
 
     def test_llm_failure_notified_once(self):
         me = self.make()
@@ -294,8 +322,11 @@ class AppTrayTest(unittest.TestCase):
         self.assertIn("Отменить переобучение", labels)
         self.assertIn("Выключить в notepad.exe", labels)
         self.assertIn("Пауза на 1 час", labels)
+        self.assertEqual(labels[:2], ["Открыть панель", "Подсказки работают"])
+        self.assertTrue(menu.items[0].default)
         retrain = next(i for i in menu.items if i.text.startswith("Переобучить"))
-        self.assertFalse(retrain.enabled)
+        self.assertFalse(retrain.visible)  # пока идёт обучение — только «Отменить»
+        self.assertNotIn("Статистика…", labels)  # старые tk-окна убраны: всё в панели
 
 
 if __name__ == "__main__":

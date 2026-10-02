@@ -64,5 +64,26 @@ class AppUsageTest(unittest.TestCase):
             self.assertGreater(rows[0]["match"] - rows[0]["acc"], len(" сделать докум"))  # до Tab печатал руками
 
 
+class BannedLLMTest(unittest.TestCase):
+    """Запрещённые слова не подсказывает и LLM: и короткая подсказка, и вариант длинной."""
+
+    def test_banned_in_llm(self):
+        from halfword.llm import LLMResult
+        with tempfile.TemporaryDirectory() as d:
+            me = make_app(Path(d))
+            me.predictor.banned = {"блин"}
+            me.cmds = None
+            me._refresh = lambda seq: None
+            me.buf = "ну бл"
+            self.assertTrue(me._banned_in(LLMResult(seq=0, text="ну бл", insert="ин какой", prob=0.9)))  # дописывает слово
+            self.assertFalse(me._banned_in(LLMResult(seq=0, text="ну бл", insert="агодарю", prob=0.9)))
+            self.assertFalse(me._banned_in(LLMResult(seq=0, text="блин, ну ", insert="ладно", prob=0.9)))  # набрал сам — не наше дело
+            me._on_llm(LLMResult(seq=0, text="ну бл", insert="ин какой", prob=0.9))
+            self.assertIsNone(me.llm_res)
+            me.variants = [LLMResult(seq=0, text="ну ", insert="и ладно", prob=0.5, kind="long", variant=0)]
+            me._on_long(LLMResult(seq=0, text="ну ", insert="и ладно, блин", prob=0.5, kind="long", variant=0))
+            self.assertEqual(me.variants, [])
+
+
 if __name__ == "__main__":
     unittest.main()

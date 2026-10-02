@@ -132,6 +132,16 @@ class SecurityTest(PanelBase):
         self.assertIn(self.panel.token.encode(), raw)  # токен для X-Token встроен в страницу
         self.assertEqual(self.req("GET", "/app.js", headers={"Cookie": f"st_token={self.panel.token}"}, token=False)[0], 200)
 
+    def test_fonts_whitelist(self):
+        cookie = {"Cookie": f"st_token={self.panel.token}"}
+        st, _, r, raw = self.req("GET", "/fonts/onest-cyrillic-wght-normal.woff2", headers=cookie, token=False)
+        self.assertEqual((st, r.getheader("Content-Type")), (200, "font/woff2"))
+        self.assertIn("immutable", r.getheader("Cache-Control"))
+        self.assertEqual(raw[:4], b"wOF2")
+        self.assertEqual(self.req("GET", "/fonts/onest-cyrillic-wght-normal.woff2", token=False)[0], 403)  # без cookie
+        self.assertEqual(self.req("GET", "/fonts/OFL.txt", headers=cookie, token=False)[0], 404)
+        self.assertEqual(self.req("GET", "/fonts/../../panel.py", headers=cookie, token=False)[0], 404)
+
     def test_url_has_token_and_loopback(self):
         self.assertTrue(self.panel.url.startswith(f"http://127.0.0.1:{self.port}/?t="))
         self.assertEqual(self.panel.httpd.server_address[0], "127.0.0.1")
@@ -308,6 +318,79 @@ class ApiTest(PanelBase):
         self.assertEqual(js["top"][0]["word"], "дела")
         self.assertGreater(js["top"][0]["support"], 0)
         self.assertIsNone(self.req("POST", "/api/sandbox", {"text": "Привет,"})[1]["suggestion"])
+
+    def test_status_program_and_pause(self):
+        self.app.typed_exe = "word.exe"
+        self.app.stats.no_caret("word.exe")
+        js = self.req("GET", "/api/status")[1]
+        self.assertEqual((js["exe"], js["exe_blocked"], js["exe_no_caret"], js["pause_until"]), ("word.exe", False, 1, 0.0))
+        self.assertEqual(self.req("POST", "/api/pause", {"on": True})[0], 501)  # у фейкового App паузы нет
+
+        def toggle():
+            self.app.pause_until = 0.0 if self.app.pause_until else time.time() + 3600
+        self.app._toggle_pause = toggle
+        self.app.pause_until = 0.0
+        self.assertGreater(self.req("POST", "/api/pause", {"on": True})[1]["pause_until"], 0)
+        self.assertGreater(self.req("POST", "/api/pause", {"on": True})[1]["pause_until"], 0)  # уже на паузе
+        self.assertEqual(self.req("POST", "/api/pause", {"on": False})[1]["pause_until"], 0)
+
+    def test_blacklist_one_program(self):
+        self.app.cfg.blacklist = ["a.exe"]
+        js = self.req("POST", "/api/blacklist/exe", {"exe": " Notepad.exe", "on": True})[1]
+        self.assertEqual(js["blacklist"], ["a.exe", "notepad.exe"])
+        self.assertTrue(self.app.blocked)
+        self.app.typed_exe = "notepad.exe"
+        self.assertTrue(self.req("GET", "/api/status")[1]["exe_blocked"])
+        js = self.req("POST", "/api/blacklist/exe", {"exe": "notepad.exe", "on": False})[1]
+        self.assertEqual((js["blacklist"], self.app.blocked), (["a.exe"], False))
+        self.assertEqual(self.req("POST", "/api/blacklist/exe", {"exe": "x.exe"})[0], 400)
+        self.assertEqual(self.req("POST", "/api/blacklist/exe", {"exe": "a/b", "on": True})[0], 400)
+
+    def test_settings_defaults_and_presets(self):
+        js = self.req("GET", "/api/settings")[1]
+        dflt = C.Config()
+        self.assertEqual(js["defaults"]["min_conf_word"], dflt.min_conf_word)
+        self.assertEqual(js["defaults"]["text_dirs"], [])
+        default = next(p for p in js["presets"] if p["key"] == "default")
+        self.assertEqual(default["values"]["llm_min_prob"], dflt.llm_min_prob)
+        for p in js["presets"]:  # пресет проходит проверку настроек
+            self.assertEqual(set(p["values"]), set(panel.PRESET_KEYS))
+            self.assertEqual(panel.apply_config(self.app, dict(p["values"]))["errors"], {})
+        tabs = {s["key"] for s in js["schema"] if s.get("tab") == "train"}
+        self.assertIn("text_dirs", tabs)
+        self.assertNotIn("learn", tabs)
+
+    def test_sandbox_explain(self):
+        js = self.req("POST", "/api/sandbox", {"text": "Привет, как де"})[1]
+        self.assertIn("не ниже порога", js["explain"]["why"])
+        self.assertEqual(js["suggestion"]["level_name"], "по предыдущим словам")
+        self.assertIn("пробел", self.req("POST", "/api/sandbox", {"text": "Привет,"})[1]["explain"]["why"])
+        self.assertIn("не знает", self.req("POST", "/api/sandbox", {"text": "Щъщъ"})[1]["explain"]["why"])
+        self.app.predictor.min_conf_word = 0.99
+        js = self.req("POST", "/api/sandbox", {"text": "Привет, как де"})[1]
+        self.assertEqual(js["suggestion"]["level"], "stem")
+        self.assertIn("общее начало", js["explain"]["why"])
+        self.app.predictor.stem_cover = 1.01  # без общей основы
+        js = self.req("POST", "/api/sandbox", {"text": "Привет, как де"})[1]
+        self.assertIsNone(js["suggestion"])
+        self.assertIn("ниже порога", js["explain"]["why"])
+        self.assertAlmostEqual(js["explain"]["need"], 0.99 + 2 * self.app.predictor.short_penalty)
+
+    def test_sandbox_llm(self):
+        self.app.llm.ready = False
+        self.assertEqual(self.req("POST", "/api/sandbox/llm", {"text": "Привет, как де"})[1],
+                         {"ready": False, "status": "LLM: выключена"})
+        from halfword.llm import LLMResult
+        self.app.llm.ready = True
+        self.app.llm.request = lambda seq, text, prefix, p, w, cb, header="": cb(LLMResult(seq, text, "ла у тебя", 0.7))
+        js = self.req("POST", "/api/sandbox/llm", {"text": "Привет, как де"})[1]
+        self.assertEqual((js["insert"], js["prob"]), ("ла у тебя", 0.7))
+        self.assertEqual(self.req("POST", "/api/sandbox/llm", {"text": " "})[0], 400)
+
+    def test_snippet_rename(self):
+        self.req("POST", "/api/snippets", {"abbr": "спс", "text": "спасибо"})
+        js = self.req("POST", "/api/snippets", {"abbr": "спсб", "text": "спасибо большое", "old": "спс"})[1]
+        self.assertEqual(js["snippets"], {"спсб": "спасибо большое"})
 
     def test_usage_summary_endpoint(self):
         now = time.time()

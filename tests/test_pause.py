@@ -106,7 +106,7 @@ class AppLogicTest(unittest.TestCase):
 
     def test_on_long_replaces_progress_and_resets_on_new_text(self):
         me = SimpleNamespace(buf="Привет. ", buf_off=0, variants=[], vi=0, cfg=SimpleNamespace(llm_rank=False),
-                             last_seq=5, _refresh=lambda seq: None)
+                             last_seq=5, _refresh=lambda seq: None, _banned_in=lambda r: False)
         A.App._on_long(me, LLMResult(5, "Привет. ", "Но", -1, "long", 0, False))
         A.App._on_long(me, LLMResult(5, "Привет. ", "Но есть", -1, "long", 0, True))
         A.App._on_long(me, LLMResult(5, "Привет. ", "Я тут", -2, "long", 1, True))
@@ -117,7 +117,7 @@ class AppLogicTest(unittest.TestCase):
 
     def test_rank_sorts_by_score(self):
         me = SimpleNamespace(buf="x ", buf_off=0, variants=[], vi=0, cfg=SimpleNamespace(llm_rank=True),
-                             last_seq=1, _refresh=lambda seq: None)
+                             last_seq=1, _refresh=lambda seq: None, _banned_in=lambda r: False)
         A.App._on_long(me, LLMResult(1, "x ", "a", -2, "long", 0))
         A.App._on_long(me, LLMResult(1, "x ", "b", -1, "long", 1))
         self.assertEqual([v.insert for v in me.variants], ["b", "a"])
