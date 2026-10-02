@@ -311,6 +311,20 @@ table.tbl { border-collapse: collapse; width: 100%; }
 .o-took { background: var(--accent); }
 .o-skip { background: var(--o-dismissed); }
 .o-miss { background: var(--o-diverged); }
+/* «Начало работы» в Обзоре */
+.start-box:not(:empty) { margin-bottom: 56px; }
+.start-box .sec { margin-top: 0; }
+.start { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; counter-reset: st; }
+.start li { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 14px 0;
+            border-bottom: 1px solid var(--line); }
+.start li:last-child { border-bottom: 0; }
+.start .chk { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font: 600 12px/1 var(--mono); font-style: normal;
+              box-shadow: inset 0 0 0 1.5px var(--line-2); color: var(--accent-ink); counter-increment: st; }
+.start .chk:empty::before { content: counter(st); color: var(--muted); }
+.start li.done .chk { background: var(--accent); box-shadow: none; }
+.start li.done b { color: var(--muted); }
+.start b { font-weight: 600; }
+.start p { color: var(--muted); font-size: 14px; margin-top: 2px; text-wrap: pretty; }
 .insights { display: grid; gap: 10px; }
 .insight { display: flex; align-items: center; justify-content: space-between; gap: 12px 24px; flex-wrap: wrap;
            padding: 14px 16px; border-radius: var(--r-2); background: var(--surface); box-shadow: inset 2px 0 0 var(--accent), 0 0 0 1px var(--line); }

@@ -284,7 +284,43 @@ async function overview() {
         h("div", { class: "sys-s" }, note)),
       h("button", { class: "btn sm ghost", onclick: () => blockExe(s.exe, !s.exe_blocked) }, s.exe_blocked ? "Включить здесь" : "Выключить здесь"));
   }
-  paint(st); live.ov = paint;
+  paint(st); live.ov = s => { paint(s); paintStart(s); };
+
+  // «Начало работы»: пока не сделаны три шага — ИИ-модель, свои тексты, песочница. Можно скрыть.
+  const startBox = h("div", { class: "start-box" });
+  let startInfo = null, startSig = "";
+  function paintStart(s) {
+    if (!startInfo || store.get("start.hidden", false)) { startBox.replaceChildren(); return; }
+    const next = JSON.stringify([s.llm_available, s.llm_installing]);
+    if (next === startSig) return;  // кнопки не перерисовываем каждую секунду
+    startSig = next;
+    const steps = [{
+      done: s.llm_available, title: "ИИ-модель ✦",
+      text: s.llm_available ? "установлена: продолжает фразы на зарядке" :
+        s.llm_installing ? `загрузка: ${s.llm_installing}` : "продолжение фраз целиком, работает без интернета",
+      act: s.llm_available || s.llm_installing ? null : h("button", { class: "btn sm primary", onclick: async e => {
+        e.currentTarget.disabled = true;
+        const d = await act("/api/llm/install", {}, "Загрузка ИИ-модели началась");
+        if (d) { status = d; paintStart(d); }
+      } }, startInfo.llm_mb ? `Установить · ${num(startInfo.llm_mb)} МБ` : "Установить"),
+    }];
+    if (startInfo.texts != null) steps.push({
+      done: startInfo.texts > 0, title: "Свои тексты",
+      text: startInfo.texts > 0 ? `найдено файлов: ${num(startInfo.texts)}` : "папки с заметками или перепиской — словарь сразу заговорит вашими словами",
+      act: startInfo.texts > 0 ? null : h("a", { class: "btn sm ghost", href: "#train:text_dirs" }, "Добавить папки →"),
+    });
+    const tried = store.get("start.sandbox", false);
+    steps.push({ done: tried, title: "Песочница", text: "наберите фразу и посмотрите, что и почему подскажет модель",
+      act: tried ? null : h("a", { class: "btn sm ghost", href: "#sandbox" }, "Открыть →") });
+    const left = steps.filter(x => !x.done).length;
+    if (!left) { startBox.replaceChildren(); return; }
+    startBox.replaceChildren(sec("Начало работы", h("span", {}, `готово ${steps.length - left} из ${steps.length} · `,
+      h("button", { class: "link", onclick: () => { store.set("start.hidden", true); startBox.replaceChildren(); } }, "скрыть")),
+      h("ol", { class: "start" }, steps.map(x => h("li", { class: x.done ? "done" : "" },
+        h("i", { class: "chk", "aria-hidden": "true" }, x.done ? "✓" : ""),
+        h("div", {}, h("b", {}, x.title), h("p", {}, x.text)), x.act)))));
+  }
+  api("/api/start").then(d => { startInfo = d; paintStart(status || st); }).catch(() => { /* без карточки */ });
 
   const hero = h("div", { class: "hero" });
   function paintHero() {
@@ -294,10 +330,12 @@ async function overview() {
     if (!t.typed && !t.shown) {  // утро: вместо огромного нуля — что было вчера и за неделю
       const y = ov.daily[ov.daily.length - 2] || { saved: 0, typed: 0 };
       const yShare = y.typed + y.saved ? y.saved / (y.typed + y.saved) : 0;
-      hero.replaceChildren(label,
-        h("div", { class: "hero-empty" }, h("h2", {}, "Сегодня ещё не печатали"),
-          h("p", {}, "Цифры появятся с первыми подсказками. Пока — как было раньше:")),
-        h("div", { class: "hero-sub" },
+      const fresh = !ov.d30.typed && !ov.d30.shown;  // совсем новый человек: «как было раньше» показывать нечего
+      put(hero, label,
+        h("div", { class: "hero-empty" }, h("h2", {}, fresh ? "Подсказки готовы" : "Сегодня ещё не печатали"),
+          h("p", {}, fresh ? "Печатайте в любой программе: подсказка появится у курсора, Tab её примет. Цифры экономии — здесь."
+            : "Цифры появятся с первыми подсказками. Пока — как было раньше:")),
+        fresh ? null : h("div", { class: "hero-sub" },
           y.saved ? h("span", {}, "вчера ", h("b", {}, num(y.saved)), " нажатий · ", h("b", {}, pct(yShare, 1)), " набора") : h("span", {}, "вчера подсказок не было"),
           w.saved ? h("span", {}, "7 дней ", h("b", {}, num(w.saved)), " нажатий · ", h("b", {}, "≈ " + dur(w.secs))) : null));
       return;
@@ -339,12 +377,13 @@ async function overview() {
       P.some(([, s]) => s.cpm) ? row("Скорость набора, зн/мин", s => (s.cpm ? num(s.cpm) : "—")) : null)));
 
   const keyRow = (k, text) => [h("span", { class: "k" }, k), h("span", {}, text)];
-  view.replaceChildren(
+  put(view,
+    startBox,
     h("div", { class: "split" }, hero,
       h("div", { class: "panel sys" }, h("div", { class: "label" }, "система"), enBox[0], llmBox[0],
         h("div", { class: "sys-rows" }, pauseRow, exeRow), h("div", { class: "sys-foot" }, llmText))),
     sec("По дням, 30 дней", segmented(METRICS, metric, v => { metric = v; drawChart(); }, "Показатель графика"), chart),
-    sec("Периоды", "принято / показано", periods),
+    ov.d30.typed || ov.d30.shown ? sec("Периоды", "принято / показано", periods) : null,
     sec("Клавиши", "работают, пока видна подсказка", h("div", { class: "keys" },
       keyRow(acceptKey, "принять подсказку целиком"),
       keyRow(keys("Ctrl", "→"), "принять одно слово"),
@@ -907,6 +946,7 @@ async function sandbox() {
   }
   ta.addEventListener("input", debounce(run, 300));
   paintScreen(); paintTheme();
+  store.set("start.sandbox", true);  // шаг «Песочница» в «Начале работы» выполнен
   view.replaceChildren(
     pageHead("проверка модели", "Песочница", "Что подскажет модель на любой текст и почему. LLM ✦ — по кнопке. Введённое нигде не сохраняется."),
     h("div", { class: "composer" }, ta, screen,

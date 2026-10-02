@@ -485,6 +485,8 @@ def build_status(app) -> dict:
           "llm_enabled": bool(app.cfg.llm_enabled), "llm_status": app._llm_status(),
           "llm_ready": bool(getattr(llm, "ready", False)), "llm_ms": round(getattr(llm, "last_ms", 0) or 0),
           "on_ac": bool(getattr(app, "on_ac", True)), "llm_only_on_ac": bool(app.cfg.llm_only_on_ac),
+          # ИИ-модель скачана? идёт загрузка («llama.cpp 42%»)? — для «Начала работы» и кнопки установки
+          "llm_available": bool(getattr(llm, "available", True)), "llm_installing": getattr(app, "llm_installing", None),
           "key": getattr(app, "key_hint", "Tab"), "mem_mb": process_memory_mb(),
           # последняя программа, где печатали: из панели «выключить здесь» и «почему тут не подсказывает»
           "exe": exe, "exe_blocked": exe in app.cfg.blacklist,
@@ -499,6 +501,23 @@ def build_status(app) -> dict:
 def overview(app) -> dict:
     s = app.stats
     return {"today": s.summary(1), "d7": s.summary(7), "d30": s.summary(30), "daily": s.daily(30)}
+
+
+def start_payload(app) -> dict:
+    """«Начало работы»: есть ли свои тексты и сколько качать ИИ-модель. Файлы считаем в потоке сервера."""
+    cfg = call_main(app, lambda: copy.copy(app.cfg))
+    out = {"texts": None, "llm_mb": None}
+    try:
+        from .trainer import sources_info
+        out["texts"] = sum(s["count"] or 0 for s in sources_info(cfg) if s["key"] in ("notes", "telegram"))
+    except Exception:  # noqa: BLE001 — без модуля обучения шаг про тексты просто не показываем
+        pass
+    try:
+        from . import setup_llm
+        out["llm_mb"] = round(setup_llm.download_size(cfg.llm_model) / 1e6)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 # --- обучение ---
@@ -601,6 +620,8 @@ class PanelServer:
             return call_main(app, lambda: settings_payload(app))
         if path == "/api/blacklist":
             return self.blacklist_payload()
+        if path == "/api/start":
+            return start_payload(app)
         if path == "/api/dict":
             prefix = q.get("prefix", "")
             return call_main(app, lambda: dict_payload(app, prefix))
@@ -633,6 +654,13 @@ class PanelServer:
             def f():
                 if bool(app.cfg.llm_enabled) != on:
                     app._toggle_llm()
+                return build_status(app)
+            return call_main(app, f)
+        if path == "/api/llm/install":
+            def f():
+                if not hasattr(app, "_install_llm"):
+                    raise PanelError("установка ИИ-модели недоступна в этой сборке", 501)
+                app._install_llm()  # сам ничего не делает, если модель уже есть или качается
                 return build_status(app)
             return call_main(app, f)
         if path == "/api/pause":

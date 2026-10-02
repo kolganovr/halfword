@@ -365,6 +365,19 @@ class ApiTest(PanelBase):
         self.assertIn("text_dirs", tabs)
         self.assertNotIn("learn", tabs)
 
+    def test_start_and_llm_install(self):
+        st, js, *_ = self.req("GET", "/api/start")
+        self.assertEqual(st, 200)
+        self.assertIn("texts", js)
+        self.assertIn("llm_mb", js)
+        st, js, *_ = self.req("GET", "/api/status")
+        self.assertIn("llm_available", js)
+        self.assertIsNone(js["llm_installing"])
+        self.assertEqual(self.req("POST", "/api/llm/install", {})[0], 501)  # у фейкового App установки нет
+        self.app._install_llm = lambda: setattr(self.app, "llm_installing", "0%")
+        st, js, *_ = self.req("POST", "/api/llm/install", {})
+        self.assertEqual((st, js["llm_installing"]), (200, "0%"))
+
     def test_sandbox_explain(self):
         js = self.req("POST", "/api/sandbox", {"text": "Привет, как де"})[1]
         self.assertIn("не ниже порога", js["explain"]["why"])

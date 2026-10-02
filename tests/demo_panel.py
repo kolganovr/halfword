@@ -112,6 +112,18 @@ def make_app(empty: bool):
     me._set_enabled = lambda on: (setattr(me.shared, "enabled", on), setattr(me.cfg, "enabled", on))
     me._toggle_llm = lambda: setattr(me.cfg, "llm_enabled", not me.cfg.llm_enabled)
     me._manage_llm = lambda refresh_power=False: None
+    me.llm.available, me.llm_installing = not empty, None
+
+    def install():  # демо: «качаем» 10 секунд, без сети
+        def work():
+            for p in range(0, 100, 10):
+                me.llm_installing = f"gemma-3-1b {p}%"
+                time.sleep(1)
+            me.llm_installing, me.llm.available, me.llm.ready = None, True, True
+        if not me.llm_installing and not me.llm.available:
+            me.llm_installing = "0%"
+            __import__("threading").Thread(target=work, daemon=True).start()
+    me._install_llm = install
     try:
         from halfword.trainer import Trainer
         me.trainer = Trainer(lambda ev: None)
