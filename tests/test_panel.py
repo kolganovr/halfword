@@ -14,6 +14,7 @@ from unittest import mock
 
 from halfword import config as C
 from halfword import panel, usage
+from halfword.layout import LayoutDetector
 from halfword.model import BaseModel, Predictor, UserModel
 from halfword.stats import Stats
 from halfword.usage import Usage
@@ -471,6 +472,167 @@ class ApplyConfigTest(PanelBase):
             self.assertIn(s["key"], names)
             v = getattr(C.Config(), s["key"])
             panel._coerce(s, v)  # значение по умолчанию укладывается в свой диапазон
+
+
+class LayoutPanelTest(PanelBase):
+    """Исправление раскладки в панели: исключения, программы без автозамены, статус, Песочница, итоги."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.det = LayoutDetector()  # словари грузятся ~1,4 с — один раз на класс
+
+    def setUp(self):
+        super().setUp()
+        det = self.det
+        det.never, det.known = set(), (lambda w: 0)
+        det._cache.clear()
+        self.app.layout = self.app.predictor.layout = det
+        self.app.predictor.layout_fix = True
+        self.app.pair = SimpleNamespace(ok=True, keymap_from="windows", reason="")
+
+    def saved(self) -> dict:
+        return json.loads((Path(self.tmp.name) / "config.json").read_text(encoding="utf-8"))
+
+    def test_never_add_remove(self):
+        det = self.det
+        det._cache["ghbdtn"] = object()  # прежнее решение детектора: после правки списка его быть не должно
+        js = self.req("POST", "/api/layout/never", {"add": " Ghbdtn "})[1]
+        self.assertEqual(js["layout_never"], ["ghbdtn"])
+        self.assertEqual(self.app.cfg.layout_never, ["ghbdtn"])
+        self.assertEqual(det.never, {"ghbdtn"})
+        self.assertEqual(det._cache, {})
+        self.assertEqual(self.saved()["layout_never"], ["ghbdtn"])
+        # запятая в латинице — буква: слово записывается так, как его узнаёт детектор
+        self.req("POST", "/api/layout/never", {"add": "nt,z"})
+        self.req("POST", "/api/layout/never", {"add": "GHBDTN"})  # повтор без дублей
+        self.assertEqual(self.app.cfg.layout_never, ["ghbdtn", det.never_key("nt,z")])
+        self.assertEqual(det.never, set(self.app.cfg.layout_never))
+        self.assertEqual(self.req("GET", "/api/dict")[1]["layout_never"], sorted(self.app.cfg.layout_never))
+        det._cache["x"] = object()
+        js = self.req("POST", "/api/layout/never", {"remove": "Ghbdtn"})[1]
+        self.assertEqual(js["layout_never"], [det.never_key("nt,z")])
+        self.assertNotIn("ghbdtn", det.never)
+        self.assertEqual(det._cache, {})
+        self.assertEqual(self.saved()["layout_never"], [det.never_key("nt,z")])
+        self.req("POST", "/api/layout/never", {"remove": "nt,z"})
+        self.assertEqual((self.app.cfg.layout_never, det.never), ([], set()))
+
+    def test_never_validation(self):
+        for body in ({}, {"add": "a", "remove": "b"}, {"add": ""}, {"add": "два слова"}, {"add": "x" * 41}, {"add": 5}):
+            self.assertEqual(self.req("POST", "/api/layout/never", body)[0], 400, body)
+        self.assertEqual(self.app.cfg.layout_never, [])
+
+    def test_never_while_detector_loads(self):
+        self.app.layout = None  # словари ещё грузятся: список пишется в config, детектор подхватит при загрузке
+        self.req("POST", "/api/layout/never", {"add": "Ghbdtn"})
+        self.assertEqual(self.app.cfg.layout_never, ["ghbdtn"])
+
+    def test_dict_has_layout_never(self):
+        self.assertEqual(self.req("GET", "/api/dict")[1]["layout_never"], [])
+        self.app.cfg.layout_never = ["b", "a"]
+        self.assertEqual(self.req("GET", "/api/dict")[1]["layout_never"], ["a", "b"])
+
+    def test_auto_off_setting(self):
+        spec = panel.SETTINGS_BY_KEY["layout_auto_off"]
+        self.assertEqual(spec["type"], "procs")
+        r = self.req("POST", "/api/settings", {"changes": {"layout_auto_off": [" Code.EXE", "code.exe", "", "wt.exe"]}})[1]
+        self.assertEqual(r["errors"], {})
+        self.assertEqual(self.app.cfg.layout_auto_off, ["code.exe", "wt.exe"])
+        self.assertEqual(self.saved()["layout_auto_off"], ["code.exe", "wt.exe"])
+        self.assertEqual(self.req("GET", "/api/settings")[1]["values"]["layout_auto_off"], ["code.exe", "wt.exe"])
+        r = self.req("POST", "/api/settings", {"changes": {"layout_auto_off": ["a/b.exe"]}})[1]
+        self.assertIn("layout_auto_off", r["errors"])
+        self.assertEqual(panel.apply_config(self.app, {"layout_auto_off": "code.exe"})["applied"], {})
+        self.assertEqual(self.app.cfg.layout_auto_off, ["code.exe", "wt.exe"])
+        self.assertEqual(self.req("GET", "/api/settings")[1]["defaults"]["layout_auto_off"], C.DEFAULT_AUTO_OFF)
+
+    def test_mode_and_hotkey_settings(self):
+        js = self.req("GET", "/api/settings")[1]
+        specs = {s["key"]: s for s in js["schema"]}
+        self.assertEqual(specs["layout_mode"]["names"], {"off": "Выкл", "suggest": "Подсказка ⇄ (Tab)",
+                                                         "auto": "Исправлять сразу (Backspace — отменить)"})
+        self.assertEqual(specs["layout_hotkey"]["names"], {"pause": "Pause", "scroll_lock": "Scroll Lock",
+                                                           "double_shift": "Shift дважды", "none": "Нет"})
+        self.assertEqual({s["group"] for s in specs.values() if s["key"].startswith("layout_")}, {"Раскладка"})
+        r = self.req("POST", "/api/settings", {"changes": {"layout_mode": "auto", "layout_hotkey": "scroll_lock"}})[1]
+        self.assertEqual(r["errors"], {})
+        self.assertEqual((self.app.cfg.layout_mode, self.app.cfg.layout_hotkey), ("auto", "scroll_lock"))
+        self.assertIn("layout_mode", self.req("POST", "/api/settings", {"changes": {"layout_mode": "всегда"}})[1]["errors"])
+
+    def test_status(self):
+        from halfword import app as A
+        app = self.app
+        app.layout_status = lambda: A.App.layout_status(app)  # настоящий текст статуса, без запуска App
+        app.cfg.layout_mode = "suggest"
+        self.assertEqual(self.req("GET", "/api/status")[1]["layout"], {"mode": "suggest", "text": "работает", "ok": True, "hotkey": "pause"})
+        app.layout = None  # словари грузятся
+        js = self.req("GET", "/api/status")[1]["layout"]
+        self.assertEqual((js["text"], js["ok"]), ("словари загружаются", False))
+        app.pair = SimpleNamespace(ok=False, reason="в Windows нет русской раскладки", keymap_from="")
+        js = self.req("GET", "/api/status")[1]["layout"]
+        self.assertEqual((js["text"], js["ok"]), ("выключено: в Windows нет русской раскладки", False))
+        app.cfg.layout_mode = "off"  # выключено самим человеком — это не поломка
+        self.assertEqual(self.req("GET", "/api/status")[1]["layout"], {"mode": "off", "text": "", "ok": True, "hotkey": "pause"})
+        del app.layout_status  # у фейкового App без статуса панель тоже живёт
+        app.cfg.layout_mode = "auto"
+        self.assertTrue(self.req("GET", "/api/status")[1]["layout"]["ok"])
+
+    def test_sandbox_layout(self):
+        app = self.app
+        app.cfg.layout_mode = "auto"
+        js = self.req("POST", "/api/sandbox", {"text": "ghbdtn "})[1]
+        s = js["suggestion"]
+        self.assertEqual((s["level"], s["level_name"]), ("layout", "исправление раскладки"))
+        lay = s["layout"]
+        self.assertEqual((lay["insert"], lay["original"], lay["to_cyr"], lay["closed"]), ("привет", "ghbdtn", True, True))
+        self.assertTrue(lay["auto"])
+        self.assertEqual(lay["auto_why"], "")
+        self.assertGreater(lay["margin"], lay["need"])
+        self.assertEqual(lay["need_auto"], self.det.p.auto_total)
+        self.assertIn("«ghbdtn» → «привет»", js["explain"]["why"])
+        app.cfg.layout_mode = "suggest"  # подсказка есть, само не исправит
+        lay = self.req("POST", "/api/sandbox", {"text": "ghbdtn "})[1]["suggestion"]["layout"]
+        self.assertFalse(lay["auto"])
+        self.assertIn("режим подсказки", lay["auto_why"])
+        app.cfg.layout_mode = "auto"
+        s = self.req("POST", "/api/sandbox", {"text": "Привет, как де"})[1]["suggestion"]
+        self.assertNotIn("layout", s)  # обычная подсказка n-грамм полей раскладки не несёт
+        self.app.layout = None  # словари грузятся: прежнее правило, подробностей детектора нет
+        self.app.predictor.layout = None
+        s = self.req("POST", "/api/sandbox", {"text": "ghbdtn"})[1]["suggestion"]
+        self.assertEqual(s["level"], "layout")
+        self.assertTrue(s["layout"]["legacy"])
+        self.assertFalse(s["layout"]["auto"])
+
+    def test_layout_endpoint_periods(self):
+        now = time.time()
+        rows = [dict(t=now, app="a.exe", src="layout", out="accepted", dir="en2ru", len="5+", chain=1, mode="auto",
+                     how="auto", switch_ok=True),
+                dict(t=now, app="a.exe", src="layout", out="undone", dir="en2ru", len="5+", chain=1, mode="auto", how="auto"),
+                dict(t=now - 3 * 86400, app="a.exe", src="layout", out="accepted", dir="ru2en", len="3-4", chain=1,
+                     mode="suggest", how="inword", switch_ok=False),
+                dict(t=now - 20 * 86400, app="a.exe", src="layout", out="accepted", dir="en2ru", len="3-4", chain=1,
+                     mode="suggest", how="delim"),
+                dict(t=now, app="a.exe", src="ngram", pos="word", out="typed", match=0, acc=0)]
+        with mock.patch.object(usage, "load", lambda p, d=None: rows):
+            js = self.req("GET", "/api/layout")[1]
+        per = js["periods"]
+        self.assertEqual((per["today"]["n"], per["today"]["auto"], per["today"]["undone"]), (2, 1, 1))
+        self.assertEqual((per["d7"]["n"], per["d7"]["accepted"]), (3, 1))
+        self.assertEqual(per["d30"]["n"], 4)
+        self.assertEqual(js["state"]["mode"], self.app.cfg.layout_mode)
+        # статистика исправлений отдаётся вместе с остальным в обзоре
+        self.app.stats.layout_fixed(5, 6)
+        ov = self.req("GET", "/api/overview")[1]
+        self.assertEqual((ov["today"]["layout_fixes"], ov["today"]["layout_saved"]), (1, 11))
+
+    def test_usage_summary_with_layout_rows(self):
+        rows = [dict(t=time.time(), app="a.exe", src="layout", out="accepted", dir="en2ru", len="5+", chain=1,
+                     mode="auto", how="auto", switch_ok=False)]
+        with mock.patch.object(usage, "load", lambda p, d=None: rows):
+            js = self.req("GET", "/api/usage?days=7")[1]
+        self.assertEqual((js["total"], js["layout"]["n"], js["layout"]["auto"]), (0, 1, 1))
+        self.assertEqual(js["layout"]["switch_fail_apps"], {"a.exe": 1})
 
 
 class AggregatesTest(unittest.TestCase):

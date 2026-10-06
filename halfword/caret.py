@@ -139,6 +139,28 @@ class CaretLocator:
             log.debug("UIA text: %s", e)
         return None
 
+    def selected_text(self, max_chars: int = 2000) -> str | None:
+        """Выделенный текст в поле с фокусом (UIA TextPattern). Пустая строка — выделения нет;
+        None — UIA недоступна или поле не отдаёт текст (тогда считаем, что выделения нет)."""
+        if not self._uia:
+            return None
+        m = self._mod
+        try:
+            el = self._uia.GetFocusedElement()
+            if not el or el.CurrentIsPassword:
+                return None
+            pat = el.GetCurrentPattern(m.UIA_TextPatternId)
+            if not pat:
+                return None
+            sel = pat.QueryInterface(m.IUIAutomationTextPattern).GetSelection()
+            if not sel or not sel.Length:
+                return ""
+            text = sel.GetElement(0).GetText(max_chars)
+            return text.replace("\r\n", "\n").replace("\r", "\n")
+        except Exception as e:
+            log.debug("UIA selection: %s", e)
+        return None
+
     # --- пароль ---
     def is_password(self, hwnd) -> bool:
         info = _gti(hwnd)

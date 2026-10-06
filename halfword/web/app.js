@@ -134,6 +134,15 @@ function meter(f, dim) { return h("div", { class: "meter" + (dim ? " dim" : "") 
 const put = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
 const keys = (...ks) => ks.map((k, i) => [i ? h("span", { class: "plus" }, "+") : null, h("kbd", {}, k)]);
 
+// строка о том, работает ли исправление раскладки: status.layout = { mode, text, ok }; выключено вами — строки нет
+function layoutLine(l, onlyProblem) {
+  if (!l || l.mode === "off" || !l.text || (onlyProblem && l.ok)) return null;
+  const loading = l.text.startsWith("словари");
+  const tag = l.ok ? ["работает", "ok"] : loading ? ["загрузка", "accent"] : ["не работает", "bad"];
+  const rest = l.ok ? l.text.replace(/^работает\s*/, "") : l.text.replace(/^выключено:\s*/, "");
+  return [h("span", { class: "tag " + tag[1] }, tag[0]), rest ? h("span", {}, rest) : null];
+}
+
 // программа в чёрный список и обратно — из Обзора, Журнала, Настроек
 async function blockExe(exe, on) {
   return act("/api/blacklist/exe", { exe, on }, on ? `${exe}: подсказки выключены` : `${exe}: подсказки включены`);
@@ -238,6 +247,17 @@ function connect() {
 const METRICS = [["saved", "нажатия"], ["accepted", "принято"], ["shown", "показано"], ["typed", "набрано"]];
 const METRIC_NAMES = { saved: "сэкономлено нажатий", accepted: "принято подсказок", shown: "показано подсказок", typed: "набрано нажатий" };
 
+// клавиши исправления раскладки — только когда оно включено
+const HOTKEY_KEYS = { pause: ["Pause"], scroll_lock: ["Scroll Lock"], double_shift: ["Shift", "Shift"] };
+function layoutKeyRows(lay, keyRow) {
+  if (!lay || lay.mode === "off") return [];
+  const rows = [];
+  if (lay.mode === "auto") rows.push(keyRow(keys("Backspace"), "сразу после исправления раскладки — вернуть как было"));
+  const hk = HOTKEY_KEYS[lay.hotkey];
+  if (hk) rows.push(keyRow(keys(...hk), "перевести последние слова или выделенное в другую раскладку; ещё раз — вернуть"));
+  return rows;
+}
+
 async function overview() {
   const [st, ov] = await Promise.all([api("/api/status"), api("/api/overview")]);
   status = st;
@@ -248,6 +268,8 @@ async function overview() {
     const d = await act("/api/llm", { on }); if (d) paint(d); else llmBox[1].checked = !on;
   });
   const pauseRow = h("div", { class: "sys-row" }), exeRow = h("div", { class: "sys-row" });
+  const layRow = h("div", { class: "sys-row" });
+  layRow.style.display = "none";  // только когда исправление раскладки включено, но не работает
   const llmText = h("div", {}), diag = h("p", { class: "diag mono" }), acceptKey = h("kbd", {}, st.key);
   let sig = "";
   async function setPause(on) {
@@ -262,7 +284,7 @@ async function overview() {
       s.llm_ready && s.llm_ms ? `ответ ≈ ${num(s.llm_ms)} мс` : null].filter(Boolean).join(" · ");
     diag.textContent = s.mem_mb != null ? `диагностика · память процесса ${s.mem_mb} МБ` : "";
     // строки с кнопками перерисовываем только при изменении: иначе клик теряется на ежесекундном обновлении
-    const next = JSON.stringify([s.pause_until, s.cfg_enabled, s.exe, s.exe_blocked, s.exe_no_caret]);
+    const next = JSON.stringify([s.pause_until, s.cfg_enabled, s.exe, s.exe_blocked, s.exe_no_caret, s.layout]);
     if (next === sig) return;
     sig = next;
     const paused = s.pause_until > 0;
@@ -271,6 +293,10 @@ async function overview() {
         h("div", { class: "sys-s" }, paused ? "подсказки вернутся сами" : s.cfg_enabled ? "выключить подсказки на час" : "подсказки и так выключены")),
       h("button", { class: "btn sm " + (paused ? "primary" : "ghost"), disabled: !paused && !s.cfg_enabled, onclick: () => setPause(!paused) },
         paused ? "Снять паузу" : "На 1 час"));
+    const lay = layoutLine(s.layout, true);
+    layRow.style.display = lay ? "" : "none";
+    layRow.replaceChildren(...(lay ? [h("div", {}, h("div", { class: "sys-t" }, "Раскладка EN ⇄ RU ", lay[0]), h("div", { class: "sys-s" }, lay[1] || "исправление не работает")),
+      h("a", { class: "btn sm ghost", href: "#settings:layout_mode" }, "Настройки")] : []));
     if (!s.exe) {
       exeRow.replaceChildren(h("div", {}, h("div", { class: "sys-t" }, "Программа"),
         h("div", { class: "sys-s" }, "здесь появится программа, где вы печатали последней")));
@@ -376,23 +402,43 @@ async function overview() {
       P.some(([, s]) => s.long_shown) ? row("в т. ч. пауза ✦✦", s => (s.long_shown ? `${num(s.long_accepted)} / ${num(s.long_shown)}` : "—"), true) : null,
       P.some(([, s]) => s.cpm) ? row("Скорость набора, зн/мин", s => (s.cpm ? num(s.cpm) : "—")) : null)));
 
+  // раскладка: исправлено и сэкономлено — из статистики, само и отменено — из журнала; блок догружается отдельно
+  const layBox = h("div", {});
+  let layData = null;
+  function paintLayStats() {
+    const d = layData;
+    const Q = d ? [["Сегодня", ov.today, d.periods.today], ["7 дней", ov.d7, d.periods.d7], ["30 дней", ov.d30, d.periods.d30]] : [];
+    if (!Q.some(([, s, u]) => s.layout_fixes || u.n)) { put(layBox); return; }
+    const r = (name, f, sub) => h("tr", { class: sub ? "sub" : "" }, h("td", {}, name), Q.map(([, s, u]) => h("td", { class: "n" }, f(s, u))));
+    put(layBox, sec("Раскладка EN ⇄ RU", "отменённые исправления не считаются", h("div", { class: "scroll" }, h("table", { class: "tbl" },
+      h("thead", {}, h("tr", {}, h("th", {}, ""), Q.map(([n]) => h("th", { class: "n" }, n)))),
+      h("tbody", {},
+        r("Исправлено", s => num(s.layout_fixes)),
+        r("в т. ч. само", (s, u) => num(u.auto), true),
+        r("Отменено", (s, u) => num(u.undone)),
+        r("Сэкономлено нажатий", s => num(s.layout_saved)))))));
+  }
+  api("/api/layout").then(d => { layData = d; paintLayStats(); }).catch(() => { /* без блока */ });
+
   const keyRow = (k, text) => [h("span", { class: "k" }, k), h("span", {}, text)];
   put(view,
     startBox,
     h("div", { class: "split" }, hero,
       h("div", { class: "panel sys" }, h("div", { class: "label" }, "система"), enBox[0], llmBox[0],
-        h("div", { class: "sys-rows" }, pauseRow, exeRow), h("div", { class: "sys-foot" }, llmText))),
+        h("div", { class: "sys-rows" }, pauseRow, layRow, exeRow), h("div", { class: "sys-foot" }, llmText))),
     sec("По дням, 30 дней", segmented(METRICS, metric, v => { metric = v; drawChart(); }, "Показатель графика"), chart),
     ov.d30.typed || ov.d30.shown ? sec("Периоды", "принято / показано", periods) : null,
+    layBox,
     sec("Клавиши", "работают, пока видна подсказка", h("div", { class: "keys" },
       keyRow(acceptKey, "принять подсказку целиком"),
       keyRow(keys("Ctrl", "→"), "принять одно слово"),
       keyRow([keys("Alt", "↓"), h("span", { class: "plus" }, "/"), h("kbd", {}, "↑")], "другой вариант длинной подсказки ✦✦"),
       keyRow(keys("Esc"), "скрыть подсказку до следующей буквы"),
-      keyRow(keys("Ctrl", "Alt", "F12"), "включить или выключить подсказки (всегда)"))),
+      keyRow(keys("Ctrl", "Alt", "F12"), "включить или выключить подсказки (всегда)"),
+      ...layoutKeyRows(st.layout, keyRow))),
     diag);
   paintHero(); drawChart();
-  every(async () => { if (tab === "overview") try { Object.assign(ov, await api("/api/overview")); paintHero(); drawChart(); } catch (e) { /* ждём следующего */ } }, 15000);
+  every(async () => { if (tab === "overview") try { Object.assign(ov, await api("/api/overview")); paintHero(); drawChart(); paintLayStats(); } catch (e) { /* ждём следующего */ } }, 15000);
 }
 
 // ближайший «круглый» шаг не меньше x: 1, 2, 2.5, 5 × 10^n (для целых счётчиков — не меньше 1)
@@ -456,7 +502,7 @@ function barChart(box, daily, key) {
 // ---------- форма настроек: общая для «Настроек» и «Обучения» ----------
 function fmtValue(s, v) {
   if (s.type === "bool") return v ? "вкл." : "выкл.";
-  if (s.type === "paths") return v && v.length ? v.join(", ") : "пусто";
+  if (s.type === "paths" || s.type === "procs") return v && v.length ? v.join(", ") : "пусто";
   if (s.type === "enum") return (s.names && s.names[v]) || v;
   return v == null ? "—" : String(v).replace(".", ",");
 }
@@ -480,8 +526,9 @@ function makeForm(d, opts = {}) {
       i = h("input", { type: "checkbox", role: "switch", checked: !!v, "aria-label": s.label });
       return [h("label", { class: "switch" }, i), i, () => i.checked, x => (i.checked = !!x)];
     }
-    if (s.type === "paths") {
-      i = h("textarea", { rows: 3, placeholder: "C:\\Users\\вы\\Documents\\Заметки", "aria-label": s.label });
+    if (s.type === "paths" || s.type === "procs") {
+      const procs = s.type === "procs";
+      i = h("textarea", { rows: procs ? 6 : 3, placeholder: procs ? "code.exe" : "C:\\Users\\вы\\Documents\\Заметки", "aria-label": s.label });
       const set = x => (i.value = (x || []).join("\n"));
       set(v);
       return [i, i, () => i.value.split("\n").map(x => x.trim()).filter(Boolean), set];
@@ -697,6 +744,27 @@ function insights(u, blocked) {
   return out.sort((a, b) => b.w - a.w).slice(0, 4);
 }
 
+// исправление раскладки по строкам журнала src = "layout": usage.layout_summary
+function layoutSec(L) {
+  const share = (x, n) => (n ? pct(x / n) : "—");
+  const fact = (label, v, text) => h("div", { class: "fact" }, h("div", { class: "label" }, label), h("div", { class: "v" }, v), h("p", {}, text));
+  const dirs = { en2ru: "en → ru", ru2en: "ru → en" };
+  const small = [
+    L.undone ? `отменено всего ${num(L.undone)}` : null,
+    L.never ? `в исключения ушло ${num(L.never)}` : null,
+    L.missed ? `пропущено, по оценке: ${num(L.missed)}` : null,
+    Object.keys(L.by_dir).length ? "исправлено: " + Object.entries(L.by_dir).map(([k, v]) => `${dirs[k] || k} ${num(v)}`).join(", ") : null,
+    Object.keys(L.switch_fail_apps).length ? "раскладка не переключилась в " + Object.entries(L.switch_fail_apps).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([k, v]) => `${k} ×${v}`).join(", ") : null,
+  ].filter(Boolean);
+  return sec("Исправление раскладки", "EN ⇄ RU", h("div", { class: "facts" },
+    L.shown ? fact("показано плашек ⇄", num(L.shown), `принято ${num(L.accepted)} (${share(L.accepted, L.shown)}), остальные оставили без внимания`) : null,
+    L.auto ? fact("исправлено само", num(L.auto), `из них отменили Backspace: ${num(L.undone_auto)} (${share(L.undone_auto, L.auto)})`) : null,
+    L.hotkey ? fact("клавишей перевода", num(L.hotkey), "слово или выделенный текст") : null,
+    L.switch_n ? fact("раскладка переключилась", share(L.switch_ok, L.switch_n), `после исправления: ${num(L.switch_ok)} из ${num(L.switch_n)}`) : null),
+    small.length ? h("p", { class: "small muted after" }, small.join(" · ")) : null);
+}
+
 async function usage() {
   let days = 7;
   const box = h("div", {});
@@ -711,7 +779,9 @@ async function usage() {
   }
   async function load() {
     const [u, bl] = await Promise.all([api("/api/usage?days=" + days), api("/api/blacklist")]);
-    if (!u.total) { box.replaceChildren(empty("За этот период в журнале пусто", "Поработайте с включёнными подсказками — исходы появятся здесь.")); return; }
+    const L = u.layout && u.layout.n ? u.layout : null;
+    if (!u.total && !L) { box.replaceChildren(empty("За этот период в журнале пусто", "Поработайте с включёнными подсказками — исходы появятся здесь.")); return; }
+    if (!u.total) { box.replaceChildren(layoutSec(L)); return; }  // были только исправления раскладки
     const srcName = k => (u.sources.find(s => s.src === k) || {}).name || k;
     const part = [];
 
@@ -763,6 +833,7 @@ async function usage() {
       if (what.length) fixSec.append(h("p", { class: "small muted after" }, "что правили — " + what.join("; ")));
       part.push(fixSec);
     }
+    if (L) part.push(layoutSec(L));
     part.push(sec("По программам", null, h("div", { class: "scroll" }, h("table", { class: "tbl" },
       h("thead", {}, h("tr", {}, h("th", {}, "Программа"), h("th", { class: "n" }, "Показано"), h("th", { class: "n" }, "Принято"), h("th", { class: "w" }, ""),
         h("th", {}, "Источники, принято / показано"), h("th", {}, ""))),
@@ -782,8 +853,12 @@ async function usage() {
 
 // ---------- Настройки ----------
 async function settings() {
-  const [d, bl] = await Promise.all([api("/api/settings"), api("/api/blacklist")]);
+  const [d, bl, st0] = await Promise.all([api("/api/settings"), api("/api/blacklist"), api("/api/status")]);
   const specs = d.schema.filter(s => s.tab !== "train");
+  const layStatus = h("p", { class: "lay-status" });
+  const paintLay = l => put(layStatus, layoutLine(l, false));
+  paintLay(st0.layout);
+  live.lay = s => paintLay(s.layout);
   const wrap = h("div", { class: "settings" + (store.get("adv", false) ? " show-adv" : "") });
   const setAdv = on => { wrap.classList.toggle("show-adv", on); advBox[1].checked = on; store.set("adv", on); };
   const advBox = switchBox("Расширенные", store.get("adv", false), on => setAdv(on));
@@ -806,7 +881,9 @@ async function settings() {
   const groups = {};
   specs.forEach(s => (groups[s.group] = groups[s.group] || []).push(s));
   const sections = Object.entries(groups).map(([g, list], i) => {
-    const node = sec(g, null, list.map(form.row));
+    const isLay = list.some(s => s.key === "layout_mode");  // группа раскладки: статус сверху, ссылка на исключения снизу
+    const node = sec(g, null, isLay ? layStatus : null, list.map(form.row), isLay ? h("p", { class: "lay-note" },
+      "Слова, которые не нужно исправлять, — во вкладке ", h("a", { href: "#dict" }, "«Словарь»"), ".") : null);
     node.id = "grp-" + i;
     if (list.every(s => s.adv)) node.classList.add("adv");
     return node;
@@ -896,6 +973,7 @@ async function sandbox() {
       chip || h("span", { class: "scr-none" }, "  подсказки нет"));
   }
   const why = h("p", { class: "why" }), metas = h("div", { class: "metas" }), top = h("div", {});
+  const layNote = h("p", { class: "small muted after" });
   const llmRes = h("span", { class: "llm-res" });
   const ta = h("textarea", { placeholder: "Привет, как де", maxlength: 2000, "aria-label": "Текст для проверки", spellcheck: "false" });
   const llmBtn = h("button", { class: "btn sm ghost", disabled: true, onclick: askLLM }, "Спросить LLM ✦");
@@ -906,7 +984,7 @@ async function sandbox() {
     llmRes.replaceChildren();
     if (!ta.value) {
       paintScreen();
-      why.replaceChildren(); metas.replaceChildren(); top.replaceChildren(); return;
+      why.replaceChildren(); metas.replaceChildren(); layNote.replaceChildren(); top.replaceChildren(); return;
     }
     const r = await act("/api/sandbox", { text: ta.value });
     if (!r || my !== seq) return;
@@ -916,11 +994,16 @@ async function sandbox() {
     why.className = "why" + (s ? " ok" : "");
     why.replaceChildren(h("b", {}, s ? "Будет подсказка: " : "Подсказки нет: "), e.why + ".");
     const m = (k, v) => h("span", {}, k + " ", h("b", {}, v));
+    const lay = s && s.layout, f1 = x => x.toFixed(1).replace(".", ",");
     put(metas,
       s ? m("как", s.level_name) : null,
+      lay ? [m("вставится", `«${lay.insert}»`), lay.legacy ? null : m("сотрётся", `${lay.erase} симв.`), m("автозамена", lay.auto ? "да" : "нет"),
+        lay.need != null ? m(lay.closed ? "перевес" : "частота перевода", `${f1(lay.margin)} при пороге ${f1(lay.need)}`) : null] : null,
       e.conf != null ? m("уверенность", pct(e.conf)) : null, e.need != null ? m("порог", pct(e.need)) : null,
       m("перед словом", `${ctxWord(r.context.c2)} ${ctxWord(r.context.c1)}`), r.context.prefix ? m("начало слова", `«${r.context.prefix}»`) : null,
       m("время", `${String(r.ms).replace(".", ",")} мс`));
+    put(layNote, lay ? (lay.auto ? "Само исправит после пробела; Backspace сразу вернёт слово как было."
+      : "Само не исправит: " + lay.auto_why + ". Подсказка ⇄ при этом показывается.") : null);
     top.replaceChildren(r.top.length ? h("table", { class: "tbl" },
       h("thead", {}, h("tr", {}, h("th", {}, "Слово"), h("th", { class: "w" }, "Вероятность"), h("th", { class: "n", title: "сколько раз слово встречалось после тех же слов" }, "Опора"), h("th", {}, ""))),
       h("tbody", {}, r.top.map((t, i) => h("tr", { class: i ? "" : "first" }, h("td", { class: "mono" }, t.word),
@@ -951,7 +1034,7 @@ async function sandbox() {
   view.replaceChildren(
     pageHead("проверка модели", "Песочница", "Что подскажет модель на любой текст и почему. LLM ✦ — по кнопке. Введённое нигде не сохраняется."),
     h("div", { class: "composer" }, ta, screen,
-      h("div", { class: "screen-bar" }, h("span", { class: "label" }, "так плашка выглядит у курсора"), themeSeg)), why, metas,
+      h("div", { class: "screen-bar" }, h("span", { class: "label" }, "так плашка выглядит у курсора"), themeSeg)), why, metas, layNote,
     h("div", { class: "llm-ask" }, llmBtn, llmRes),
     sec("Топ-8 кандидатов n-грамм", "по вероятности", top));
   ta.focus();
@@ -963,7 +1046,7 @@ async function dict() {
   let prefix = "", editing = null;  // editing — сокращение, которое сейчас правят
   async function load() {
     const d = await api("/api/dict?prefix=" + encodeURIComponent(prefix));
-    paintWords(d); paintBanned(d.banned); paintSnippets(d.snippets);
+    paintWords(d); paintBanned(d.banned); paintNever(d.layout_never || []); paintSnippets(d.snippets);
   }
   const ban = async w => { if (await act("/api/dict/ban", { word: w }, `«${w}» больше не подсказывается`)) load(); };
   function paintWords(d) {
@@ -988,6 +1071,21 @@ async function dict() {
       h("button", { type: "button", title: "Разрешить", "aria-label": `Разрешить «${w}»`, onclick: async () => { const r = await act("/api/dict/unban", { word: w }, "Разрешено"); if (r) load(); } }, "×")))) :
       h("p", { class: "muted" }, "Пусто."),
       h("div", { class: "joined" }, banInput, h("button", { class: "btn ghost", onclick: addBan }, "Запретить")));
+  }
+  // исключения раскладки: слово остаётся как набрано; правятся сразу, без «Сохранить»
+  const neverBox = h("div", {});
+  const neverInput = h("input", { type: "text", placeholder: "слово, как оно набрано", maxlength: 40, "aria-label": "Слово, которое не исправлять", class: "mono" });
+  async function neverEdit(body, msg) {
+    const r = await act("/api/layout/never", body, msg);
+    if (r) paintNever(r.layout_never);
+  }
+  const addNever = () => { const w = neverInput.value.trim(); if (w) { neverInput.value = ""; neverEdit({ add: w }, `«${w}» больше не исправляется`); } };
+  neverInput.addEventListener("keydown", e => { if (e.key === "Enter") addNever(); });
+  function paintNever(list) {
+    neverBox.replaceChildren(list.length ? h("div", { class: "chips" }, list.map(w => h("span", { class: "chip" }, w,
+      h("button", { type: "button", title: "Снова исправлять", "aria-label": `Снова исправлять «${w}»`, onclick: () => neverEdit({ remove: w }, "Снова исправляется") }, "×")))) :
+      h("p", { class: "muted" }, "Пусто."),
+      h("div", { class: "joined" }, neverInput, h("button", { class: "btn ghost", onclick: addNever }, "Не исправлять")));
   }
   const abbr = h("input", { type: "text", placeholder: "спс", maxlength: 40, "aria-label": "Сокращение", class: "short" });
   const text = h("input", { type: "text", placeholder: "спасибо", maxlength: 2000, "aria-label": "Текст", class: "grow" });
@@ -1032,6 +1130,8 @@ async function dict() {
     h("div", { class: "search" }, icon, q),
     sec("Слова", found, wordsBox),
     sec("Запрещённые слова", "не подсказываются никогда", h("p", { class: "lead" }, "Можно запретить любое слово, даже то, которого нет в списке выше: например, неудачную подсказку LLM."), banBox),
+    sec("Исключения раскладки", "не исправляются никогда", h("p", { class: "lead" },
+      "Слова, которые исправление раскладки не трогает: пишите слово так, как оно набрано, до исправления. Сюда они попадают и сами: после второй отмены автозамены клавишей Backspace."), neverBox),
     sec("Сниппеты", "свои сокращения: «спс» → «спасибо»", snBox));
   await load();
 }

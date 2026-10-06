@@ -14,6 +14,15 @@
   case — регистр, short — закончил раньше (точка, Enter, перестал печатать).
 Правка после принятия (fix): kept — не трогал; cut — стёр хвост и пошёл дальше; edit — стёр и переписал;
   ctrlbs — Ctrl+Backspace; undo — сочетание клавиш (Ctrl+Z и т.п.) сразу после принятия.
+
+Исправление раскладки — отдельные строки с src = "layout" (текст не пишется, только форма):
+  dir — en2ru / ru2en; len — 1-2 / 3-4 / 5+ букв в самом длинном слове; chain — слов в исправлении;
+  mode — suggest / auto (режим на тот момент); how — inword (плашка посреди слова), delim (плашка после разделителя),
+  auto (исправлено само), hotkey (ручная клавиша);
+  out — accepted (исправлено: Tab, само или клавишей), ignored (плашку не приняли), undone (отменили Backspace
+  или повторной клавишей), never (после второй отмены слово ушло в исключения), missed (человек стёр закрытое слово
+  ≥3 букв и набрал взамен его перевод, а детектор молчал — только dir и len);
+  switch_ok — раскладка после исправления сменилась (проверка через ~150 мс).
 """
 from __future__ import annotations
 
@@ -34,6 +43,7 @@ FIX_KEPT = 20           # столько символов дальше без с
 FIX_TIMEOUT_S = 30
 UNDO_S = 5
 MAX_BYTES = 20_000_000  # дальше usage.jsonl → usage.1.jsonl
+LAYOUT_PUNCT = ".,;:!?()\"'"
 
 
 def place(buf: str) -> str:
@@ -91,6 +101,65 @@ def diff_kind(sugg: str, real: str) -> str:
     return "word"
 
 
+def len_bucket(n: int) -> str:
+    return "1-2" if n <= 2 else "3-4" if n <= 4 else "5+"
+
+
+def layout_info(original: str, to_cyr: bool, words: int, mode: str, how: str) -> dict:
+    """Форма исправления раскладки для журнала: направление, длина самого длинного слова, цепочка, режим, способ."""
+    longest = max((len(w.strip(LAYOUT_PUNCT)) for w in original.split()), default=0)
+    return dict(dir="en2ru" if to_cyr else "ru2en", len=len_bucket(longest), chain=words, mode=mode, how=how)
+
+
+class MissWatch:
+    """Пропуск раскладки: стёр Backspace-ами законченное слово и набрал взамен ровно его перевод.
+
+    Слова держим только в памяти, пока идёт сравнение; наружу отдаются направление и длина.
+    convert(слово) → (перевод, в кириллицу?); silent(текст) → детектор по такому тексту промолчал.
+    """
+
+    def __init__(self, convert, silent):
+        self.convert, self.silent = convert, silent
+        self.run = ""      # стёртое подряд Backspace-ами
+        self.watch = None  # {"target", "got", "dir", "len"}: сравниваем набранное с переводом стёртого
+
+    def bs(self, removed: str):
+        self.watch = None
+        self.run = removed + self.run
+
+    def other(self):
+        self.run, self.watch = "", None
+
+    def char(self, ch: str) -> dict | None:
+        """→ {"dir", "len"}, когда пропуск замечен."""
+        if self.watch is None and self.run:
+            self.watch, self.run = self._arm(self.run), ""
+        w = self.watch
+        if w is None:
+            return None
+        w["got"] += ch
+        got, target = w["got"], w["target"]
+        if got == target or target.startswith(got):
+            return None  # переводит дальше (или слово напечатано, ждём разделитель)
+        if got.startswith(target) and len(got) == len(target) + 1 and not ch.isalnum():
+            self.watch = None
+            return {"dir": w["dir"], "len": w["len"]}
+        self.watch = None
+        return None
+
+    def _arm(self, run: str) -> dict | None:
+        if run[-1:].isalnum():
+            return None  # слово было не закончено
+        word = run.strip().rstrip(LAYOUT_PUNCT + " ")
+        if len(word.split()) != 1 or sum(c.isalpha() for c in word) < 3:
+            return None
+        conv, to_cyr = self.convert(word)
+        if conv == word or sum(c.isalpha() for c in conv) < 3 or not self.silent(run):
+            return None
+        return {"target": conv, "got": "", "dir": "en2ru" if to_cyr else "ru2en",
+                "len": len_bucket(len(word))}
+
+
 class Episode:
     def __init__(self, full: str, src: str, pos: str, app: str, now: float, gap: int, idle: int, variants: int):
         self.full = full            # подсказка целиком от точки показа
@@ -137,6 +206,7 @@ class Usage:
         self.cur: Episode | None = None     # та, что сейчас на плашке
         self.fix: Episode | None = None     # принятая, ждём правок
         self.rows: list[dict] = []
+        self.lay: dict | None = None        # плашка ⇄ на экране: {"t", "app", "info", "stale"}
         self.last_key = 0.0
         self.gaps: list[float] = []
         self.swap = False
@@ -174,6 +244,11 @@ class Usage:
 
     def char(self, ch: str):
         self._key()
+        if self.lay:
+            if self.lay["info"]["how"] == "inword" and not ch.isspace() and not self.lay["stale"]:
+                self.lay["stale"] = True  # слово дописывают: плашка пересчитается, пока не покажут снова — ждём
+            else:
+                self._lay_close("ignored")
         for ep in list(self.open):
             self._step(ep)
             ep.typed += ch
@@ -184,6 +259,7 @@ class Usage:
 
     def bs(self):
         self._key()
+        self._lay_close("ignored")
         for ep in list(self.open):
             self._step(ep)
             if not ep.typed:
@@ -203,6 +279,7 @@ class Usage:
 
     def accept(self, text: str):
         """Tab / Ctrl+→: text вставлен в позицию курсора."""
+        self._lay_close("ignored")
         ep = self.cur if self.cur in self.open else None
         if self.fix:
             self._fix_done(self.fix, None)
@@ -225,12 +302,14 @@ class Usage:
             self.swap = True
 
     def dismiss(self):
+        self._lay_close("ignored")
         if self.cur in self.open:
             self._close(self.cur, "dismissed")
         self.cur = None
 
     def reset(self, reason: str = ""):
         """Клик, стрелки, сочетания клавиш, смена окна: текст перед курсором уже не тот."""
+        self._lay_close("ignored")
         for ep in list(self.open):
             self._close(ep, "lost")
         self.cur = None
@@ -247,6 +326,36 @@ class Usage:
                 self._fix_done(f, "undo")
             else:
                 self._fix_done(f, None)
+
+    # --- исправление раскладки ---
+    def layout_shown(self, info: dict, app: str):
+        """Плашка ⇄ на экране. Пока слово дописывают, это один показ: пересчитанная плашка его не дробит."""
+        lay = self.lay
+        if lay and all(lay["info"][k] == info[k] for k in ("dir", "how", "mode")):
+            lay["info"], lay["stale"] = info, False
+            return
+        self._lay_close("ignored")
+        self.lay = {"t": self.clock(), "app": app, "info": info, "stale": False}
+
+    def layout_done(self, out: str, info: dict, app: str, **extra) -> dict:
+        """Исправление состоялось (accepted: Tab, само или клавишей) или его отменили (undone / never)."""
+        lay, self.lay = self.lay, None
+        t0 = lay["t"] if lay and out == "accepted" and info["how"] in ("inword", "delim") else self.clock()
+        return self._lay_row(out, info, app, t0, **extra)
+
+    def layout_missed(self, app: str, dir_: str, len_: str):
+        self._lay_row("missed", dict(dir=dir_, len=len_), app, self.clock())
+
+    def _lay_row(self, out: str, info: dict, app: str, t0: float, **extra) -> dict:
+        r = dict(t=int(t0), app=app, src="layout", out=out, **info,
+                 **({"vis": int((self.clock() - t0) * 1000)} if out in ("accepted", "ignored") else {}), **extra)
+        self.rows.append(r)
+        return r
+
+    def _lay_close(self, out: str):
+        lay, self.lay = self.lay, None
+        if lay:
+            self._lay_row(out, lay["info"], lay["app"], lay["t"])
 
     def flush(self):
         if not self.rows or not self.path:
@@ -357,9 +466,50 @@ def load(path: Path, days: int | None = None) -> list[dict]:
     return rows
 
 
+def _split_layout(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    return [r for r in rows if r.get("src") != "layout"], [r for r in rows if r.get("src") == "layout"]
+
+
+def layout_summary(lay: list[dict]) -> dict:
+    """Агрегаты по строкам src == "layout": показано/принято в suggest, само, вручную, отмены, пропуски, переключение."""
+    shown = [r for r in lay if r.get("how") in ("inword", "delim") and r["out"] in ("accepted", "ignored")]
+    acc = [r for r in shown if r["out"] == "accepted"]
+    auto = [r for r in lay if r.get("how") == "auto" and r["out"] == "accepted"]
+    hand = [r for r in lay if r.get("how") == "hotkey" and r["out"] == "accepted"]
+    undone = [r for r in lay if r["out"] == "undone"]
+    undone_auto = [r for r in undone if r.get("how") == "auto"]
+    sw = [r["switch_ok"] for r in lay if r.get("switch_ok") is not None]
+    return dict(n=len(lay), shown=len(shown), accepted=len(acc), auto=len(auto), hotkey=len(hand),
+                undone=len(undone), undone_auto=len(undone_auto),
+                never=sum(r["out"] == "never" for r in lay), missed=sum(r["out"] == "missed" for r in lay),
+                switch_n=len(sw), switch_ok=sum(bool(x) for x in sw),
+                by_dir=dict(Counter(r["dir"] for r in lay if r["out"] == "accepted")),
+                switch_fail_apps=dict(Counter(r["app"] or "?" for r in lay if r.get("switch_ok") is False)))
+
+
+def layout_report(lay: list[dict]) -> str:
+    a = layout_summary(lay)
+
+    def pct(x, n):
+        return f"{x / n:.0%}" if n else "—"
+
+    out = ["\nРаскладка (EN ⇄ RU): "
+           f"показано {a['shown']}, принято {a['accepted']} ({pct(a['accepted'], a['shown'])}); "
+           f"само {a['auto']}, клавишей {a['hotkey']}; отменено {a['undone']} "
+           f"({pct(a['undone_auto'], a['auto'])} автоисправлений), в исключения {a['never']}; "
+           f"пропущено (оценка) {a['missed']}; переключение ок {pct(a['switch_ok'], a['switch_n'])}"]
+    if a["switch_fail_apps"]:
+        top = sorted(a["switch_fail_apps"].items(), key=lambda x: -x[1])[:5]
+        out.append("  не переключилась: " + ", ".join(f"{k} ×{v}" for k, v in top))
+    return "\n".join(out)
+
+
 def report(rows: list[dict]) -> str:
-    if not rows:
+    rows, lay = _split_layout(rows)
+    if not rows and not lay:
         return "Журнал подсказок пока пуст (data/usage.jsonl)."
+    if not rows:
+        return layout_report(lay).lstrip("\n")
     out = [f"Подсказок в журнале: {len(rows)}"]
     head = (f"{'':16}{'показано':>9}{'принято':>9}{'по сл.':>7}{'сам':>6}{'мимо':>6}{'Esc':>5}"
             f"{'совп. до ухода':>15}{'сэкон.':>8}")
@@ -415,6 +565,8 @@ def report(rows: list[dict]) -> str:
     for app, c in top:
         out.append(f"  {app or '?':22} " + "  ".join(f"{SRC_NAMES[s]} {c[s]}/{c['acc_' + s]}"
                                                     for s in ("ngram", "llm", "long") if c[s]))
+    if lay:
+        out.append(layout_report(lay))
     return "\n".join(out)
 
 
@@ -446,6 +598,7 @@ def _group(g: list[dict]) -> dict:
 
 def summary(rows: list[dict]) -> dict:
     """Агрегаты журнала: источник × место, программы, «напечатал сам», расхождения, правки после принятия."""
+    rows, lay = _split_layout(rows)
     srcs = []
     for src in ("ngram", "llm", "long"):
         rs = [r for r in rows if r["src"] == src]
@@ -482,7 +635,7 @@ def summary(rows: list[dict]) -> dict:
         a["accepted"] += ok
         s["n"] += 1
         s["acc"] += ok
-    return dict(total=len(rows), sources=srcs,
+    return dict(total=len(rows), sources=srcs, layout=layout_summary(lay),
                 hand=dict(n=len(hand), fast=fast, fast_share=fast / len(hand) if hand else 0.0,
                           by_src=dict(Counter(r["src"] for r in hand))),
                 late=dict(n=len(late), avg_chars=round(sum(r["match"] - r["acc"] for r in late) / len(late), 1) if late else 0.0),

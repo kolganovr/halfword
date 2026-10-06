@@ -12,6 +12,7 @@ USER_MODEL = DATA_DIR / "user_model.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 STATS_FILE = DATA_DIR / "stats.json"
 USAGE_FILE = DATA_DIR / "usage.jsonl"  # журнал подсказок без текста
+LAYOUT_STATE_FILE = DATA_DIR / "layout_state.json"  # сколько раз отменяли исправление раскладки для слова
 PREDICTOR_KEYS = ("min_conf_word", "min_conf_next", "min_support", "short_penalty")
 
 
@@ -50,6 +51,15 @@ DEFAULT_BLACKLIST = [
     "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "mintty.exe",
     "openconsole.exe", "excel.exe",
 ]
+
+# автозамена раскладки молчит в терминалах и редакторах кода: там ввод часто и есть «не слово»
+DEFAULT_AUTO_OFF = [
+    "code.exe", "antigravity.exe", "cursor.exe", "devenv.exe", "idea64.exe", "pycharm64.exe",
+    "windowsterminal.exe", "wt.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "mintty.exe",
+    "openconsole.exe",
+]
+LAYOUT_MODES = ("off", "suggest", "auto")
+LAYOUT_HOTKEYS = ("pause", "scroll_lock", "double_shift", "none")
 
 
 @dataclass
@@ -95,7 +105,11 @@ class Config:
     fast_typing_ms: int = 180       # медиана пауз между нажатиями быстрее — набор «вслепую»
     fast_min_insert: int = 4        # на быстром наборе показывать только подсказки не короче
     doc_cache: bool = False         # слова и пары из текущего поля с повышенным весом (+0.1 п.п.)
-    layout_fix: bool = True         # «ghbdtn» → «привет»: подсказка при не той раскладке
+    # «ghbdtn» → «привет»: off — не трогать, suggest — плашка ⇄ и Tab, auto — исправлять самому на разделителе
+    layout_mode: str = "suggest"
+    layout_hotkey: str = "pause"            # ручной перевод слова или выделения: pause | scroll_lock | double_shift | none
+    layout_never: list[str] = field(default_factory=list)   # слова, которые не считать набранными не в той раскладке
+    layout_auto_off: list[str] = field(default_factory=lambda: list(DEFAULT_AUTO_OFF))  # программы без автозамены
     snippets: dict[str, str] = field(default_factory=dict)  # свои сокращения: «спс» → «спасибо»
     banned_words: list[str] = field(default_factory=list)   # не подсказывать эти слова
     # обучение
@@ -114,9 +128,17 @@ class Config:
             for k, v in d.items():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
+            if "layout_mode" not in d and d.get("layout_fix") is False:
+                cfg.layout_mode = "off"  # прежняя настройка «исправлять раскладку: нет»
         else:
             cfg.save()
         cfg.blacklist = [x.lower() for x in cfg.blacklist]
+        cfg.layout_auto_off = [x.lower() for x in cfg.layout_auto_off]
+        cfg.layout_never = [x.lower() for x in cfg.layout_never]
+        if cfg.layout_mode not in LAYOUT_MODES:
+            cfg.layout_mode = "suggest"
+        if cfg.layout_hotkey not in LAYOUT_HOTKEYS:
+            cfg.layout_hotkey = "pause"
         return cfg
 
     def save(self):

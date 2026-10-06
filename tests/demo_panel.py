@@ -1,9 +1,11 @@
 """Демо-стенд веб-панели на синтетике: временная папка данных, выдуманный журнал и статистика.
 
-    python -X utf8 tests/demo_panel.py [порт] [--empty]
+    python -X utf8 tests/demo_panel.py [порт] [--empty] [--no-layout | --no-pair]
 
 Печатает ссылку с токеном. Нужен для ревью и скриншотов панели без запуска Halfword и без личных данных.
 --empty — первый запуск: пустая статистика и журнал.
+--no-layout — словари раскладки «ещё грузятся» (детектора нет), --no-pair — в Windows нет пары раскладок:
+так видна строка о том, что исправление раскладки не работает.
 """
 import json
 import os
@@ -23,9 +25,11 @@ from types import SimpleNamespace  # noqa: E402
 
 from halfword import config as C  # noqa: E402
 from halfword import panel  # noqa: E402
+from halfword.layout import KeyMap, LayoutDetector  # noqa: E402
 from halfword.model import BaseModel, Predictor, UserModel  # noqa: E402
 from halfword.stats import Stats  # noqa: E402
 from halfword.usage import Usage  # noqa: E402
+from halfword.winhook import LayoutPair  # noqa: E402
 
 CORPUS = ["Привет, как дела? Привет, как дела у тебя. Привет, как дела сегодня. Как дела на работе?",
           "Документ готов. Документы на визу. Документов много. Документа нет. Документ отправлен вчера.",
@@ -48,6 +52,7 @@ def fake_stats(path: Path, rnd: random.Random):
         days[d] = dict(typed=typed, shown=shown, accepted=acc, inserted=acc * 5, saved=acc * 4,
                        type_ms=typed * 180, type_n=typed, llm_shown=llm_s, llm_accepted=llm_a, llm_saved=llm_a * 7,
                        long_shown=long_s, long_accepted=long_a, long_saved=long_a * 14, word_accepts=acc // 2,
+                       layout_fixes=rnd.randint(0, 14), layout_saved=rnd.randint(0, 14) * 9,
                        no_caret={"Discord.exe": rnd.randint(0, 40)} if i < 3 else {})
     path.write_text(json.dumps({"days": days}, ensure_ascii=False), encoding="utf-8")
 
@@ -70,8 +75,31 @@ def fake_usage(path: Path, rnd: random.Random):
         if src == "long":
             r["var"], r["cyc"] = 3, rnd.randint(0, 2)
         rows.append(r)
+    rows += fake_layout_rows(rnd, now)
     rows.sort(key=lambda r: r["t"])
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def fake_layout_rows(rnd: random.Random, now: float) -> list[dict]:
+    """Исправления раскладки без текстов: только форма события, как пишет usage.Usage."""
+    rows = []
+    for _ in range(220):
+        how = rnd.choice(["auto"] * 4 + ["inword"] * 3 + ["delim"] * 2 + ["hotkey"])
+        out = rnd.choice(["accepted"] * 6 + ["ignored"] * 3 + ["undone"] * 2 + ["never", "missed"])
+        if how in ("inword", "delim") and out in ("undone", "never"):
+            out = "ignored"
+        if how == "auto" and out == "ignored":
+            out = "accepted"
+        r = dict(t=int(now - rnd.uniform(0, 7 * 86400)), app=rnd.choice(APPS), src="layout", out=out,
+                 dir=rnd.choice(["en2ru"] * 4 + ["ru2en"]), len=rnd.choice(["1-2", "3-4", "5+", "5+"]))
+        if out != "missed":
+            r.update(chain=rnd.choice([1, 1, 1, 2, 3]), mode="auto" if how == "auto" else "suggest", how=how)
+        if out in ("accepted", "ignored"):
+            r["vis"] = rnd.randint(150, 4000)
+        if out == "accepted":
+            r["switch_ok"] = rnd.random() < (0.5 if r["app"] == "Telegram.exe" else 0.95)
+        rows.append(r)
+    return rows
 
 
 def fake_runs(path: Path):
@@ -95,6 +123,8 @@ def make_app(empty: bool):
     cfg.panel_port = 0
     cfg.snippets = {} if empty else {"спс": "спасибо", "мск": "Москва", "адр": "ул. Примерная, 1"}
     cfg.banned_words = []
+    cfg.layout_mode = "auto"
+    cfg.layout_never = [] if empty else ["ghbv", "cdtn"]
     cfg.blacklist = list(cfg.blacklist) + ([] if empty else ["keepass.exe"])
     user = UserModel()
     if not empty:
@@ -108,6 +138,7 @@ def make_app(empty: bool):
         llm=SimpleNamespace(ready=not empty, configured={}, last_ms=340), cmds=queue.Queue(),
         exe="Telegram.exe", typed_exe="Telegram.exe", blocked=False, key_hint="Tab", on_ac=True, pause_until=0.0)
     me.llm.configure = lambda **kw: me.llm.configured.update(kw)
+    add_layout(me, cfg)
     me._llm_status = lambda: "LLM: готова" if me.llm.ready else "LLM: не установлена"
     me._set_enabled = lambda on: (setattr(me.shared, "enabled", on), setattr(me.cfg, "enabled", on))
     me._toggle_llm = lambda: setattr(me.cfg, "llm_enabled", not me.cfg.llm_enabled)
@@ -131,6 +162,24 @@ def make_app(empty: bool):
     except Exception:  # noqa: BLE001
         pass
     return me
+
+
+def add_layout(me, cfg):
+    """Детектор раскладки, пара раскладок и статус — как у App; флаги --no-layout и --no-pair ломают их напоказ."""
+    if "--no-pair" in sys.argv:
+        me.pair = LayoutPair(reason="в Windows нет русской и английской раскладок")
+    else:
+        me.pair = LayoutPair(ru=0x4190419, en=0x4090409, keymap=KeyMap(), keymap_from="windows")
+    me.layout = None
+    me.predictor.layout_fix = True
+    if "--no-layout" not in sys.argv and me.pair.ok:
+        me.layout = me.predictor.layout = LayoutDetector(known=me.predictor.word_count, never=cfg.layout_never)
+    try:
+        from halfword.app import App
+        me.layout_status = lambda: App.layout_status(me)
+    except Exception:  # noqa: BLE001 — без tkinter статус собираем тем же текстом
+        me.layout_status = lambda: ("выключено: " + me.pair.reason if not me.pair.ok else
+                                    "словари загружаются" if me.layout is None else "работает")
 
 
 def main():

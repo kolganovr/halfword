@@ -407,6 +407,13 @@ table.tbl { border-collapse: collapse; width: 100%; }
 .joined .grow { flex: 1; min-width: 200px; }
 .after { margin-top: 10px; }
 
+/* ---------- раскладка ---------- */
+.lay-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -8px 0 6px; font-size: 13.5px; color: var(--muted); }
+.lay-status:empty { display: none; }
+.lay-note { margin-top: 14px; font-size: 13.5px; color: var(--muted); }
+.lay-note a { color: var(--accent); }
+@media (min-width: 721px) { #f-layout_mode { grid-template-columns: minmax(0, 1fr) minmax(200px, 390px); } }  /* длинная подпись режима */
+
 /* ---------- песочница ---------- */
 .composer { display: grid; gap: 0; border-radius: var(--r-3); background: var(--surface); box-shadow: var(--hi), 0 0 0 1px var(--line);
             overflow: hidden; transition: box-shadow var(--t) var(--ease); }

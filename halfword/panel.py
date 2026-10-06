@@ -19,6 +19,7 @@ import os
 import secrets
 import threading
 import time
+from datetime import datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -102,7 +103,18 @@ SETTINGS = [
     _s("fast_min_insert", "Точность", "Минимальная длина подсказки на быстром наборе",
        "Больше — меньше помех при беглом наборе, но реже подсказки.", "int", min=1, max=15, **ADV),
     _s("doc_cache", "Точность", "Слова из текущего поля", "Слова и пары из того, что уже написано в поле, весят больше.", "bool", **ADV),
-    _s("layout_fix", "Общее", "Исправлять раскладку", "«ghbdtn» → «привет»: подсказка при не той раскладке.", "bool"),
+    _s("layout_mode", "Раскладка", "Исправление раскладки",
+       "«ghbdtn» → «привет». Подсказка: появляется плашка ⇄, Tab принимает. Сразу: исправляет само после пробела, "
+       "Backspace возвращает как было.",
+       "enum", choices=["off", "suggest", "auto"],
+       names={"off": "Выкл", "suggest": "Подсказка ⇄ (Tab)", "auto": "Исправлять сразу (Backspace — отменить)"}),
+    _s("layout_hotkey", "Раскладка", "Клавиша перевода раскладки",
+       "Переводит последнее слово или выделенный текст; повторное нажатие возвращает как было.",
+       "enum", choices=["pause", "scroll_lock", "double_shift", "none"],
+       names={"pause": "Pause", "scroll_lock": "Scroll Lock", "double_shift": "Shift дважды", "none": "Нет"}),
+    _s("layout_auto_off", "Раскладка", "Программы без автозамены",
+       "По одной на строку, например code.exe. Там само не исправляется, а подсказка ⇄ остаётся: "
+       "в терминалах и редакторах кода набор часто и есть не слово.", "procs"),
     _s("learn", "Общее", "Дообучаться на наборе", "Запоминать слова, набранные руками (кроме паролей и чёрного списка).", "bool"),
     _s("accept_key", "Общее", "Клавиша принятия", "Tab или стрелка вправо.", "enum", choices=["tab", "right"],
        names={"tab": "Tab", "right": "→ стрелка вправо"}),
@@ -144,6 +156,23 @@ LLM_CONFIGURE = {"llm_prompt_chars": "keep_long", "llm_long_tokens": "long_token
                  "llm_long_min_tok_p": "long_min_tok_p", "llm_variants": "variants"}
 
 
+BAD_EXE_CHARS = '\\/:*?"<>|\r\n'
+
+
+def _exe_list(names, err) -> list[str]:
+    """Имена программ: нижний регистр, без пустых и дублей; странное имя → err(сообщение)."""
+    out: list[str] = []
+    for n in names:
+        n = n.strip().lower()
+        if not n:
+            continue
+        if len(n) > 100 or any(c in n for c in BAD_EXE_CHARS):
+            raise err(f"странное имя программы {n[:30]!r}")
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def _coerce(spec: dict, v):
     t = spec["type"]
     if t == "paths":
@@ -154,6 +183,10 @@ def _coerce(spec: dict, v):
         if missing:
             raise ValueError("нет такой папки: " + missing[0])
         return out
+    if t == "procs":
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v) or len(v) > 200:
+            raise ValueError("нужен список программ")
+        return _exe_list(v, ValueError)
     if t == "bool":
         if not isinstance(v, bool):
             raise ValueError("нужно true/false")
@@ -275,11 +308,74 @@ def dict_payload(app, prefix: str = "", limit: int = 200) -> dict:
     items = [(w, n) for w, n in uni.items() if w.startswith(prefix)]
     items.sort(key=lambda x: (-x[1], x[0]))
     return {"words": [{"word": w, "n": n} for w, n in items[:limit]], "found": len(items), "total": len(uni),
-            "banned": sorted(app.cfg.banned_words), "snippets": dict(app.cfg.snippets)}
+            "banned": sorted(app.cfg.banned_words), "snippets": dict(app.cfg.snippets),
+            "layout_never": sorted(app.cfg.layout_never)}
 
 
 def dict_forget(app, word: str) -> int:
     return app.predictor.user.forget(word)
+
+
+# --- исправление раскладки: исключения и статус ---
+MAX_NEVER = 1000
+
+
+def layout_never_edit(app, body: dict) -> list[str]:
+    """Добавить слово в исключения раскладки (add) или убрать (remove). ГЛАВНЫЙ ПОТОК.
+
+    Слово записывается так, как его узнаёт детектор («nt,z»: запятая в латинице — буква), поэтому ключ — never_key.
+    Детектор подхватывает список сразу, а его кэш с прежними решениями сбрасывается.
+    """
+    add, rm = body.get("add"), body.get("remove")
+    if (add is None) == (rm is None):
+        raise PanelError("нужно одно из: add, remove")
+    word = add if add is not None else rm
+    if not isinstance(word, str) or not word.strip():
+        raise PanelError("нужно слово")
+    word = word.strip()
+    if len(word) > 40 or any(c.isspace() for c in word):
+        raise PanelError("нужно одно слово, до 40 символов")
+    det = getattr(app, "layout", None)
+    key = (det.never_key(word) if det is not None else word).lower()
+    if not key:
+        raise PanelError("это не слово")
+    cur = list(app.cfg.layout_never)
+    if add is not None:
+        if key not in cur:
+            if len(cur) >= MAX_NEVER:
+                raise PanelError("слишком много исключений")
+            cur.append(key)
+    else:
+        cur = [w for w in cur if w not in (key, word.lower())]
+    app.cfg.layout_never = cur
+    app.cfg.save()
+    if det is not None:
+        det.never = {w.lower() for w in cur}
+        det._cache.clear()
+    return sorted(cur)
+
+
+def layout_state(app) -> dict:
+    """Что с исправлением раскладки: {"mode", "text", "ok"}. ok=False — включено, но не работает (нет раскладок, словари грузятся)."""
+    mode = getattr(app.cfg, "layout_mode", "off")
+    text = ""
+    fn = getattr(app, "layout_status", None)
+    if mode != "off" and fn is not None:
+        try:
+            text = fn() or ""
+        except Exception:  # noqa: BLE001 — статус вторичен, панель из-за него не падает
+            log.exception("панель: статус раскладки")
+    return {"mode": mode, "text": text, "ok": not text or text.startswith("работает"),
+            "hotkey": getattr(app.cfg, "layout_hotkey", "none")}
+
+
+def layout_periods(rows: list[dict]) -> dict:
+    """Итоги журнала по раскладке за сегодня, 7 и 30 дней (границы по календарным дням, как в Stats.summary)."""
+    from . import usage
+    lay = [r for r in rows if r.get("src") == "layout"]
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    cuts = {"today": midnight, "d7": midnight - 6 * 86400, "d30": midnight - 29 * 86400}
+    return {k: usage.layout_summary([r for r in lay if r.get("t", 0) >= t]) for k, t in cuts.items()}
 
 
 def _set_banned(app, words: list[str]):
@@ -344,8 +440,13 @@ def explain(p, text: str, s) -> dict:
     else:
         need = p.min_conf_next
     if s is not None:
-        if s.level in ("snippet", "layout"):
-            out["why"] = "сработал сниппет" if s.level == "snippet" else "набрано в другой раскладке"
+        if s.level == "snippet":
+            out["why"] = "сработал сниппет"
+            return out
+        if s.level == "layout":
+            fx = s.fix
+            out["why"] = ("набрано не в той раскладке: " + f"«{fx.original.strip()}» → «{fx.insert.strip()}»" if fx
+                          else "набрано не в той раскладке (словари раскладки ещё грузятся — действует прежнее правило)")
             return out
         if s.level == "stem":  # лидер не дотянул до порога — дописываем общее начало вариантов
             dist = p.distribution(c2, c1, prefix)[0]
@@ -398,6 +499,32 @@ def overlay_theme(app) -> str:
         return "light"
 
 
+def layout_sandbox(app, s) -> dict:
+    """Подробности исправления раскладки для Песочницы: что вставится, сработает ли автозамена и с каким перевесом."""
+    fx, mode = s.fix, getattr(app.cfg, "layout_mode", "off")
+    pair = getattr(app, "pair", None)
+    if fx is None:  # детектор ещё грузится, подсказка по прежнему правилу
+        return {"legacy": True, "insert": s.insert.strip(), "erase": s.replace, "auto": False,
+                "auto_why": "словари раскладки ещё загружаются"}
+    p = app.layout.p if getattr(app, "layout", None) is not None else None
+    if mode != "auto":
+        why = "включён режим подсказки" if mode == "suggest" else "исправление раскладки выключено"
+    elif pair is not None and not pair.ok:
+        why = "нет пары раскладок"
+    elif not fx.closed:
+        why = "слово не закончено: само исправляет после пробела или знака"
+    elif not fx.auto:
+        why = "перевес ниже порога автозамены" if p is None else f"перевес ниже порога автозамены ({p.auto_total:g})"
+    else:
+        why = ""
+    return {"legacy": False, "original": fx.original.strip(), "insert": fx.insert.strip(), "erase": fx.erase,
+            "to_cyr": fx.to_cyr, "words": fx.words, "closed": fx.closed, "margin": round(fx.margin, 2),
+            # закрытое слово: перевес цепочки против порога подсказки; недописанное: частота перевода (Zipf) против порога
+            "need": (p.suggest_total if fx.closed else p.auto_conv_known) if p else None,
+            "need_auto": p.auto_total if p else None,
+            "auto": not why, "auto_why": why}
+
+
 def sandbox(app, text: str) -> dict:
     """Что подскажет n-граммная модель на этот текст и почему. ГЛАВНЫЙ ПОТОК."""
     p = app.predictor
@@ -406,9 +533,13 @@ def sandbox(app, text: str) -> dict:
     ms = (time.perf_counter() - t0) * 1000
     c2, c1, prefix, _start, _sp = parse_context(text)
     dist, sup = p.distribution(c2, c1, prefix)
-    return {"suggestion": None if not s else {"insert": s.insert, "word": s.word, "level": s.level,
-                                               "level_name": LEVEL_NAMES.get(s.level, s.level),
-                                               "confidence": round(s.confidence, 3), "whole_word": s.whole_word},
+    sug = None
+    if s:
+        sug = {"insert": s.insert, "word": s.word, "level": s.level, "level_name": LEVEL_NAMES.get(s.level, s.level),
+               "confidence": round(s.confidence, 3), "whole_word": s.whole_word}
+        if s.level == "layout":
+            sug["layout"] = layout_sandbox(app, s)
+    return {"suggestion": sug,
             "explain": explain(p, text, s),
             "ms": round(ms, 2), "context": {"c2": c2, "c1": c1, "prefix": prefix}, "theme": overlay_theme(app),
             "top": [{"word": p.surface(w), "p": round(pr, 4), "support": sup.get(w, 0)} for w, pr in dist[:8]]}
@@ -494,6 +625,7 @@ def build_status(app) -> dict:
           "exe": exe, "exe_blocked": exe in app.cfg.blacklist,
           "exe_no_caret": app.stats.no_caret_apps(1).get(exe, 0) if exe else 0,
           "today": {k: t[k] for k in ("shown", "accepted", "saved")}}
+    st["layout"] = layout_state(app)
     tr = train_state(app)
     if tr is not None:
         st["train"] = tr
@@ -624,6 +756,9 @@ class PanelServer:
             return self.blacklist_payload()
         if path == "/api/start":
             return start_payload(app)
+        if path == "/api/layout":
+            return {"state": call_main(app, lambda: layout_state(app)),
+                    "periods": layout_periods(self.usage_rows(30))}
         if path == "/api/dict":
             prefix = q.get("prefix", "")
             return call_main(app, lambda: dict_payload(app, prefix))
@@ -719,6 +854,8 @@ class PanelServer:
             return {"ok": True}
         if path == "/api/snippets":
             return {"snippets": call_main(app, lambda: snippets_edit(app, body))}
+        if path == "/api/layout/never":
+            return {"layout_never": call_main(app, lambda: layout_never_edit(app, body))}
         raise PanelError("нет такого адреса", 404)
 
 

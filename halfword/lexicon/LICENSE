@@ -1,0 +1,13 @@
+Word frequency lists ru.txt.gz and en.txt.gz
+
+Derived from wordfreq 3.1.1 (https://github.com/rspeer/wordfreq) by Robyn Speer:
+the top words of each language with their Zipf frequency, filtered to plain words.
+
+The wordfreq data is licensed under the Creative Commons Attribution-ShareAlike 4.0
+International license (CC BY-SA 4.0, https://creativecommons.org/licenses/by-sa/4.0/).
+It is built from Wikipedia, OPUS OpenSubtitles, SUBTLEX, Google Books Ngrams, NewsCrawl,
+GlobalVoices, Reddit, Twitter and other sources listed in the wordfreq README.
+
+These two files are distributed under the same CC BY-SA 4.0 license.
+The rest of Halfword is under the MIT license (see LICENSE in the repository root).
+Rebuild: tools/build_lexicon.py

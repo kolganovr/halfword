@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import logging.handlers
 import os
@@ -16,14 +17,16 @@ import webbrowser
 from . import config as C
 from . import panel
 from .caret import CaretLocator
+from .layout import LayoutDetector
 from .llm import LLM, on_ac_power
 from .model import DOC_WEIGHT, WORD_CH, WORD_RE, BaseModel, Predictor, Suggestion, UserModel, parse_context
 from .overlay import Overlay
 from .stats import Stats
 from .trainer import Trainer
-from .usage import Usage
-from .winhook import (MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared, process_name, send_key, send_text,
-                      switch_layout, user32, window_header)
+from .usage import MissWatch, Usage, layout_info
+from .winhook import (LANG_ENGLISH, LANG_RUSSIAN, MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared, focus_hkl,
+                      layout_pair, primary_lang, process_name, send_key, send_text, switch_layout, user32,
+                      window_header)
 
 log = logging.getLogger("halfword")
 DEBUG = os.environ.get("HALFWORD_DEBUG") == "1"  # в лог пишется и текст подсказок — только для отладки
@@ -35,6 +38,11 @@ SYNC_CHARS = 64        # сколько текста поля сверять с 
 SYNC_LAG = 3           # поле может отставать от буфера на столько символов (приложение ещё не вставило)
 SYNC_GIVE_UP = 5       # столько расхождений подряд — поле отдаёт не тот текст, в этом окне больше не сверяем
 CYR_RE = re.compile(r"[А-Яа-яЁё]")
+AUTO_DELIMS = set(".,;:!?)]}\"'»…")  # кроме пробельных: символы, после которых автозамена раскладки смотрит на слово
+LAYOUT_TAIL = 400      # сколько символов текста отдаём детектору раскладки (смотрит на последние слова)
+SWITCH_CHECK_MS = 150  # через сколько проверить, что окно сменило раскладку
+SWITCH_OVERRIDE_S = 0.4  # столько хук переводит нажатия в новой раскладке, не спрашивая окно
+MANUAL_UNDO_S = 3.0    # повторная ручная клавиша за это время откатывает перевод
 
 
 def typed_after(buf: str, buf_off: int, text: str, off: int) -> str | None:
@@ -99,6 +107,13 @@ class App:
     gaps: list = []
     learned = None
     panel = None
+    layout = None          # LayoutDetector; пока грузятся словари — None, работает прежнее правило в слове
+    pair = None            # winhook.LayoutPair: установленные русская и английская раскладки
+    layout_floor = 0       # абсолютная позиция: текст раньше неё детектору раскладки не отдаём (отменено, отклонено)
+    undo = None            # автозамена, которую ещё можно отменить Backspace
+    manual = None          # последний ручной перевод — повторная клавиша откатит
+    miss = None            # MissWatch: пропуски раскладки для журнала
+    layout_state = None    # счётчики отмен по словам (data/layout_state.json)
 
     def __init__(self):
         self.cfg = C.Config.load()
@@ -111,7 +126,8 @@ class App:
         self.stats = Stats(C.STATS_FILE)
         self.usage = Usage(C.USAGE_FILE)
         self.events: queue.Queue = queue.Queue()
-        self.shared = Shared(enabled=self.cfg.enabled, accept_right=self.cfg.accept_key == "right")
+        self.shared = Shared(enabled=self.cfg.enabled, accept_right=self.cfg.accept_key == "right",
+                             layout_hotkey=self.cfg.layout_hotkey)
         self.hook = Hook(self.events, self.shared)
         self.root = tk.Tk()
         self.root.withdraw()
@@ -165,6 +181,8 @@ class App:
         self._icons: dict = {}
         self._icon_state = None
         self._menu_key = None
+        self._pair_check = 0.0
+        self._init_layout()
 
     def _apply_predictor_cfg(self):
         """Пороги и переключатели предсказателя из config (при запуске и после правки в панели)."""
@@ -174,9 +192,16 @@ class App:
         p.min_insert = cfg.min_insert_chars
         p.next_min_tri = cfg.next_min_tri
         p.doc_weight = DOC_WEIGHT if cfg.doc_cache else 0.0
-        p.layout_fix = cfg.layout_fix
+        p.layout_fix = self._layout_mode() != "off"
+        if self.layout:
+            self.layout.never = {w.lower() for w in cfg.layout_never}
+            self.layout._cache.clear()  # в кэше слова с прежними исключениями
+        if getattr(self, "shared", None) is not None:
+            self.shared.layout_hotkey = getattr(cfg, "layout_hotkey", "none")
         p.snippets = {k.lower(): v for k, v in cfg.snippets.items()}
         p.banned = {w.lower() for w in cfg.banned_words}
+        if hasattr(self, "layout"):
+            self._update_gate()
 
     def _load_base(self) -> BaseModel:
         """Модель с диска; нет или битая — пустая, а обучение идёт в отдельном процессе."""
@@ -193,6 +218,281 @@ class App:
         base = BaseModel()
         base._index()
         return base
+
+    # --- исправление раскладки ---
+    def _layout_mode(self) -> str:
+        return getattr(self.cfg, "layout_mode", "off")
+
+    def _update_gate(self):
+        """Хук придерживает ввод после разделителя только при автозамене и готовом детекторе."""
+        if getattr(self, "shared", None) is None:
+            return  # ещё в __init__: выставится, когда загрузится детектор
+        self.shared.layout_gate = (self._layout_mode() == "auto" and self.layout is not None
+                                   and self.pair is not None and self.pair.ok)
+
+    def _init_layout(self):
+        """Раскладки из Windows и детектор: словари грузятся ~1.4 с, поэтому в потоке; объект живёт до выхода."""
+        try:
+            st = json.loads(C.LAYOUT_STATE_FILE.read_text(encoding="utf-8"))
+            self.layout_state = st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            self.layout_state = {}
+        self.pair = layout_pair()
+        if not self.pair.ok:
+            log.warning("исправление раскладки выключено: %s", self.pair.reason)
+            return
+        pair, never = self.pair, list(self.cfg.layout_never)
+
+        def work():
+            try:
+                det = LayoutDetector(known=self.predictor.word_count, never=never, keymap=pair.keymap)
+            except Exception:
+                log.exception("не загрузил словари раскладки")
+                return
+            self.cmds.put(lambda: self._set_layout(det))
+
+        threading.Thread(target=work, daemon=True, name="layout-load").start()
+
+    def _set_layout(self, det: LayoutDetector):
+        self.layout = self.predictor.layout = det
+        self.miss = MissWatch(det.convert_text, lambda text: det.detect(text) is None)
+        det.never = {w.lower() for w in self.cfg.layout_never}
+        det._cache.clear()
+        self._update_gate()
+        log.info("детектор раскладки готов (таблица клавиш: %s)", self.pair.keymap_from if self.pair else "?")
+
+    def layout_status(self) -> str:
+        """Для панели: почему исправление раскладки не работает или что оно работает."""
+        if self.pair is None:
+            return ""
+        if not self.pair.ok:
+            return "выключено: " + self.pair.reason
+        if self.layout is None:
+            return "словари загружаются"
+        return "работает" + ("" if self.pair.keymap_from == "windows" else " (запасная таблица клавиш)")
+
+    def _layout_blocked(self) -> bool:
+        """Сейчас активна не русская и не английская раскладка (например, грузинская): детектор молчит."""
+        if self.pair is None or not self.pair.ok:
+            return False
+        return primary_lang(focus_hkl(self.fg)) not in (LANG_RUSSIAN, LANG_ENGLISH)
+
+    def _layout_text(self) -> str | None:
+        """Текст для детектора: после «нижней границы» (отменённое и отклонённое не берём), не длиннее LAYOUT_TAIL.
+
+        None — детектора нет (грузится), Predictor применит прежнее правило; "" — раскладку сейчас не проверяем.
+        """
+        if self.layout is None:
+            return None
+        if self._layout_blocked():
+            return ""
+        return self.buf[max(0, self.layout_floor - self.buf_off):][-LAYOUT_TAIL:]
+
+    def _later(self, ms: int, fn, *args):
+        self.root.after(ms, fn, *args)
+
+    def _switch(self, cyr: bool, row: dict | None = None):
+        if self.pair is not None and self.pair.ok:
+            self._switch_hkl(self.pair.hkl(cyr), row)
+
+    def _switch_hkl(self, hkl: int, row: dict | None = None):
+        """Попросить окно с фокусом сменить раскладку и через SWITCH_CHECK_MS проверить, что сменилась.
+
+        Не сменилась — повтор в окно верхнего уровня и ещё одна проверка; итог — row["switch_ok"].
+        """
+        if not hkl:
+            return
+        if focus_hkl(self.fg) & 0xFFFFFFFF == hkl & 0xFFFFFFFF:
+            if row is not None:
+                row["switch_ok"] = True
+            return
+        switch_layout(hkl, self.fg)
+        # окно применит просьбу позже, а придержанные нажатия повторяются сразу: хук переводит их уже в новой
+        self.shared.hkl_override, self.shared.hkl_override_until = hkl, time.perf_counter() + SWITCH_OVERRIDE_S
+        self._later(SWITCH_CHECK_MS, self._check_switch, hkl, 0, row)
+
+    def _check_switch(self, hkl: int, attempt: int, row: dict | None):
+        if focus_hkl(self.fg) & 0xFFFFFFFF == hkl & 0xFFFFFFFF:
+            ok = True
+        elif attempt == 0:
+            switch_layout(hkl, self.fg, top=True)
+            self._later(SWITCH_CHECK_MS, self._check_switch, hkl, 1, row)
+            return
+        else:
+            ok = False
+            log.warning("раскладка не переключилась в %s", self.exe or "?")
+        if row is not None:
+            row["switch_ok"] = ok
+
+    def _disarm_undo(self):
+        self.undo = None
+        self.shared.undo_armed = False
+
+    def _apply_layout(self, fix, how: str, before_insert=None) -> tuple[dict, int]:
+        """Стереть fix.erase символов, вставить fix.insert, переключить раскладку. → (строка журнала, прежняя HKL).
+
+        Раскладку просим сменить до вставки: в конце вставки хук повторяет придержанные нажатия, и они должны
+        попасть в окно уже в новой раскладке. before_insert(prev) — успеть взвести отмену до этих повторов.
+        """
+        prev = focus_hkl(self.fg) if self.pair is not None and self.pair.ok else 0
+        self._hide()
+        info = layout_info(fix.original, fix.to_cyr, fix.words, self._layout_mode(), how)
+        row = self.usage.layout_done("accepted", info, self.exe)
+        self.usage.reset("layout")
+        self.stats.layout_fixed(fix.erase, len(fix.insert))
+        self._switch(fix.to_cyr, row)
+        self.buf = self.buf[:max(0, len(self.buf) - fix.erase)]
+        self._append(fix.insert)
+        self.sync_due = self.pending_reload = False  # поле ещё обрабатывает замену: сверять с ним рано
+        self.suggestion = None
+        if before_insert:
+            before_insert(prev)
+        self._insert(fix.insert, erase=fix.erase)
+        return row, prev
+
+    def _layout_auto(self, ch: str):
+        """Автозамена: слово закрыто разделителем, детектор уверен — исправить и взвести отмену Backspace."""
+        if (self._layout_mode() != "auto" or self.layout is None or self.pair is None or not self.pair.ok
+                or self.exe in getattr(self.cfg, "layout_auto_off", ())
+                or not (ch.isspace() or ch in AUTO_DELIMS)):
+            return
+        if self.pending_reload:
+            self._sync_field()  # контекст после клика: сначала настоящий текст поля
+        text = self._layout_text()
+        fix = self.layout.detect(text) if text else None
+        if not fix or not (fix.auto and fix.closed):
+            return
+        field = self.caret.text_before_caret(fix.erase + SYNC_LAG + 1)
+        if field and not field_agrees(self.buf, field):
+            log.debug("автозамена раскладки пропущена: поле не совпадает с буфером")
+            return
+        def arm(prev):  # Backspace, придержанный с пробела, повторится в конце вставки — он уже отмена
+            self.undo = {"fix": fix, "prev": prev or self.pair.hkl(not fix.to_cyr), "end": self._end()}
+            self.shared.undo_armed = True
+
+        self._apply_layout(fix, "auto", before_insert=arm)
+        log.debug("автозамена раскладки (%s слов)", fix.words)
+
+    def _layout_undo(self) -> bool:
+        """Backspace, который хук проглотил после автозамены: вернуть написанное и прежнюю раскладку."""
+        u, self.undo = self.undo, None
+        self.shared.undo_armed = False
+        if u is None or u["end"] != self._end():
+            send_key(VK_BACK, extra=MAGIC)  # отменять уже нечего — это был обычный Backspace
+            return self._handle("bs")
+        fix = u["fix"]
+        self._hide()
+        self._switch_hkl(u["prev"])  # до вставки: придержанные нажатия повторятся уже в прежней раскладке
+        self.buf = self.buf[:max(0, len(self.buf) - len(fix.insert))]
+        self._append(fix.original)
+        self.layout_floor = self._end()  # отменённое детектор больше не трогает
+        self.sync_due = False
+        self._insert(fix.original, erase=len(fix.insert))
+        info = layout_info(fix.original, fix.to_cyr, fix.words, self._layout_mode(), "auto")
+        self.usage.layout_done("undone", info, self.exe)
+        self.stats.layout_fixed(fix.erase, len(fix.insert), undo=True)
+        self._count_undo(fix, info)
+        return True
+
+    def _never_words(self, original: str) -> list[str]:
+        """Слова исправления в том виде, как их узнаёт детектор: у слова с , . ; ' [ ] в латинице это часть слова."""
+        words = []
+        for tok in original.split():
+            core = self.layout.never_key(tok)
+            if core and (len(core) >= 3 or len(original.split()) == 1) and core not in words:
+                words.append(core)
+        return words
+
+    def _count_undo(self, fix, info: dict):
+        """Вторая отмена того же слова — в исключения (layout_never)."""
+        key = "".join(fix.original.lower().split())
+        if self.layout_state is None:
+            self.layout_state = {}
+        undo = self.layout_state.setdefault("undo", {})
+        undo[key] = undo.get(key, 0) + 1
+        if undo[key] >= 2:
+            undo.pop(key)
+            new = [w for w in self._never_words(fix.original) if w not in self.cfg.layout_never]
+            if new:
+                self.cfg.layout_never.extend(new)
+                self.cfg.save()
+                self.layout.never |= set(new)
+                self.layout._cache.clear()
+            self.usage.layout_done("never", info, self.exe)
+            log.info("слово ушло в исключения раскладки (после второй отмены)")
+        try:
+            C.LAYOUT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            C.LAYOUT_STATE_FILE.write_text(json.dumps(self.layout_state, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            log.exception("не сохранил layout_state.json")
+
+    def _layout_key(self, vk: int) -> bool:
+        """Ручная клавиша: повтор сразу после перевода откатывает; есть выделение — переводит его; иначе последнюю цепочку."""
+        prev_manual, self.manual = self.manual, None
+        det = self.layout
+        if det is None or self.pair is None or not self.pair.ok or self.password:
+            self._pass_through("layout_key", (vk,))
+            return True
+        mode = self._layout_mode()
+        if prev_manual and time.time() - prev_manual["t"] <= MANUAL_UNDO_S:
+            m = prev_manual
+            self._hide()
+            self._switch_hkl(m["prev"])  # до вставки, как и при исправлении
+            self._insert(m["original"], erase=len(m["insert"]))
+            self.buf = self.buf[:max(0, len(self.buf) - len(m["insert"]))]
+            self._append(m["original"])
+            self.layout_floor = self._end()
+            self.sync_due = False
+            info = layout_info(m["original"], m["to_cyr"], m["words"], mode, "hotkey")
+            self.usage.layout_done("undone", info, self.exe)
+            self.stats.layout_fixed(len(m["original"]), len(m["insert"]), undo=True)
+            return True
+        get_sel = getattr(self.caret, "selected_text", None)
+        sel = get_sel() if get_sel else None  # нет UIA или поле не отдаёт текст — выделения нет, буфер обмена не трогаем
+        if sel:
+            conv, to_cyr = det.convert_text(sel)
+            if conv == sel:
+                return True
+            prev = focus_hkl(self.fg)
+            self._hide()
+            info = layout_info(sel, to_cyr, len(sel.split()), mode, "hotkey")
+            row = self.usage.layout_done("accepted", info, self.exe)
+            self.usage.reset("layout")
+            self.stats.layout_fixed(len(sel), len(conv))
+            self._switch(to_cyr, row)  # до вставки, как и при исправлении
+            self._insert(conv)  # набор поверх выделения заменяет его
+            self._reset_buf()
+            self.pending_reload = True   # текст вокруг выделения неизвестен — перечитаем из поля
+            self.sync_due = False
+            self.manual = {"t": time.time(), "insert": conv, "original": sel, "to_cyr": to_cyr,
+                           "words": len(sel.split()), "prev": prev}
+            return True
+        text = self._layout_text()
+        fix = det.convert_last(text) if text else None
+        if fix is None or fix.insert == fix.original:
+            return True
+        _row, prev = self._apply_layout(fix, "hotkey")
+        self.manual = {"t": time.time(), "insert": fix.insert, "original": fix.original, "to_cyr": fix.to_cyr,
+                       "words": fix.words, "prev": prev}
+        return True
+
+    def _pass_through(self, kind: str, args: tuple):
+        """Клавишу проглотил хук, а действовать не нужно (выключено, чёрный список, пароль): вернуть её окну."""
+        if kind == "layout_undo":
+            send_key(VK_BACK, extra=MAGIC)
+        elif kind == "layout_key" and args and args[0]:
+            send_key(args[0], extra=MAGIC)
+
+    def _miss_bs(self, removed: str):
+        if self.miss is not None and removed and self._layout_mode() != "off":
+            self.miss.bs(removed)
+
+    def _miss_char(self, ch: str):
+        if self.miss is None or self._layout_mode() == "off":
+            return
+        ev = self.miss.char(ch)
+        if ev:
+            self.usage.layout_missed(self.exe, ev["dir"], ev["len"])
 
     # --- цикл ---
     def run(self):
@@ -216,7 +516,11 @@ class App:
             while True:
                 ev = self.events.get_nowait()
                 self.last_seq = ev[0]
-                typed = self._handle(ev[1], *ev[2:]) or typed
+                try:
+                    typed = self._handle(ev[1], *ev[2:]) or typed
+                finally:
+                    if self.shared.gated:  # решение по закрытому слову принято — придержанный ввод отпускаем
+                        self.hook.release_held()
                 if ev[1] == "char":
                     self.typed_exe = self.exe  # для пунктов трея «выключить в <программе>»
                 changed = True
@@ -272,6 +576,12 @@ class App:
 
     def _handle(self, kind: str, *args) -> bool:
         """→ True, если событие могло изменить текст (тогда LLM спрашиваем заново)."""
+        if kind != "layout_undo":
+            self._disarm_undo()  # любое событие, кроме самой отмены, закрывает окно отмены автозамены
+        if kind != "layout_key":
+            self.manual = None
+        if kind in ("enter", "reset", "dismiss", "layout_undo", "layout_key") and self.miss is not None:
+            self.miss.other()
         if kind == "toggle":
             self._set_enabled(not self.shared.enabled)
             return True
@@ -293,6 +603,7 @@ class App:
             self.usage.reset("window")
             log.debug("окно: %s%s", self.exe, " (чёрный список)" if self.blocked else "")
         if not self.shared.enabled or self.blocked:
+            self._pass_through(kind, args)  # хук проглотил клавишу раскладки, а мы здесь молчим
             if self.buf:
                 self._reset_buf()
             self.usage.reset("off")
@@ -324,11 +635,14 @@ class App:
             self.last_key = now
             self.stats.typed()
             self.usage.char(ch)
+            self._miss_char(ch)
             if not re.match(rf"[{WORD_CH}\-'’]", ch):
                 self._learn(self.buf)
             self._append(ch)
             self.dismissed = False
+            self._layout_auto(ch)
         elif kind == "bs":
+            self._miss_bs(self.buf[-1:])
             self.buf = self.buf[:-1]
             self._unlearn_if_erased()
             self.usage.bs()
@@ -348,8 +662,14 @@ class App:
             self.need_check = True
             self.pending_reload = False
         elif kind == "dismiss":
+            if self.suggestion is not None and self.suggestion.level == "layout":
+                self.layout_floor = self._end()  # отклонённое исправление детектор не предлагает снова
             self.dismissed = True
             self.usage.dismiss()
+        elif kind == "layout_undo":
+            return self._layout_undo()
+        elif kind == "layout_key":
+            return self._layout_key(*args)
         elif kind in ("accept", "accept_word"):
             self._accept(kind == "accept_word", *args)
         return True
@@ -389,11 +709,19 @@ class App:
         text = chunk + (" " if last and s.whole_word else "")
         self.overlay.hide()
         self._insert(text, erase=s.replace)
+        row = None
         if s.replace:
             self.buf = self.buf[:max(0, len(self.buf) - s.replace)]
-            if s.level == "layout":  # дальше печатать в нужной раскладке
-                switch_layout(self.fg, bool(CYR_RE.search(text)))
-        self.usage.accept(text)
+        if s.level == "layout":
+            cyr = s.fix.to_cyr if s.fix else bool(CYR_RE.search(text))
+            info = self._layout_info(s, cyr)
+            row = self.usage.layout_done("accepted", info, self.exe)
+            self.usage.reset("layout")
+            self.stats.layout_fixed(s.replace, len(text))
+        else:
+            self.usage.accept(text)
+        if s.level == "layout":
+            self._switch(cyr, row)  # дальше печатать в нужной раскладке
         # учим только слова, после которых уже стоит пробел; недописанное (основа, кусок по Ctrl+→)
         # выучится, когда допечатаешь его и поставишь разделитель
         tmp = self.buf
@@ -410,6 +738,13 @@ class App:
         self.partial = word and not last
         log.debug("принято (%s%s)", s.level, ", слово" if word else "")
 
+    def _layout_info(self, s, cyr: bool) -> dict:
+        """Форма показанного исправления для журнала. Прежнее правило (детектор ещё грузится) — слово в одно «слово»."""
+        if s.fix is not None:
+            how = "delim" if s.fix.closed else "inword"
+            return layout_info(s.fix.original, s.fix.to_cyr, s.fix.words, self._layout_mode(), how)
+        return layout_info("x" * s.replace, cyr, 1, self._layout_mode(), "inword")
+
     def _can_suggest(self) -> bool:
         return (self.shared.enabled and not self.blocked and not self.password
                 and not self.dismissed and bool(self.buf.strip()))
@@ -419,7 +754,11 @@ class App:
             return None
         t0 = time.perf_counter()
         # длинная подсказка из паузы, пока печатаешь ровно её, важнее коротких
-        s = self._long_suggestion() or self._merge(self.predictor.suggest(self.buf), self._llm_suggestion())
+        s = self._long_suggestion()
+        if not s:
+            lt = self._layout_text()
+            ng = self.predictor.suggest(self.buf) if lt is None else self.predictor.suggest(self.buf, layout_text=lt)
+            s = ng if ng and ng.level == "layout" else self._merge(ng, self._llm_suggestion())
         if s and s.level not in ("long", "layout", "snippet") and not self._worth_showing(s):
             s = None
         if DEBUG:
@@ -657,7 +996,10 @@ class App:
         self.shared.shown_seq = seq
         self.shared.visible = True
         self.stats.shown(s.insert, llm=llm, long=long)
-        self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0)
+        if s.level == "layout":
+            self.usage.layout_shown(self._layout_info(s, bool(CYR_RE.search(s.insert))), self.exe)
+        else:
+            self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0)
 
     def _hide(self):
         self.overlay.hide()
@@ -822,6 +1164,8 @@ class App:
             return  # успела начаться более новая загрузка
         self.predictor.base = base
         self.predictor._uni_cache = uni_cache
+        if self.layout is not None:
+            self.layout._cache.clear()  # оценки слов зависят от счётов базовой модели
         log.info("базовая модель подменена: %s слов", f"{len(base.uni):,}")
 
     def _train_apply(self) -> bool:
@@ -940,6 +1284,10 @@ class App:
             self._llm_warned = True
             self._notify("LLM-сервер не запускается, см. server.log")
         self._refresh_tray()
+        if self.pair is not None and not self.pair.ok and now - self._pair_check > 30:
+            self._pair_check = now  # поставили русскую или английскую раскладку — подхватываем без перезапуска
+            if layout_pair().ok:
+                self._init_layout()
         if now - self._train_check > 300:
             self._auto_train(now)
 

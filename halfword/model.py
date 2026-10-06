@@ -17,6 +17,8 @@ from itertools import accumulate
 from pathlib import Path
 from typing import Iterable
 
+from .layout import LayoutDetector, LayoutFix
+
 WORD_CH = r"0-9A-Za-zÀ-ÿА-Яа-яЁё"
 WORD_RE = re.compile(rf"[{WORD_CH}]+(?:[-'’][{WORD_CH}]+)*")
 TRAILING_WORD_RE = re.compile(rf"[{WORD_CH}]+(?:[-'’][{WORD_CH}]*)*$")
@@ -69,6 +71,7 @@ class Suggestion:
     level: str         # tri / uni / stem / layout / snippet
     whole_word: bool = True  # после принятия ставить пробел
     replace: int = 0   # стереть столько символов перед курсором, потом вставить insert (раскладка, сниппет)
+    fix: LayoutFix | None = None  # исправление раскладки от детектора (для level == "layout")
 
 
 class BaseModel:
@@ -289,6 +292,7 @@ class Predictor:
         self.banned: set[str] = set()  # не подсказывать (нижний регистр)
         self.doc_weight = 0.0         # вес слов текущего поля; 0 — выключено
         self.layout_fix = False       # подсказка при не той раскладке
+        self.layout: LayoutDetector | None = None  # детектор раскладки; пока грузится или нет раскладок — старое правило
         self.snippets: dict[str, str] = {}  # сокращение (нижний регистр) → текст
         self._doc_key = None
         self._doc_uni: Counter = Counter()
@@ -431,14 +435,31 @@ class Predictor:
         return Suggestion(insert=word, word=word, confidence=pr, level="layout", whole_word=True,
                           replace=len(raw))
 
-    def suggest(self, text: str) -> Suggestion | None:
+    def word_count(self, w: str) -> int:
+        """Сколько раз слово (нижний регистр) встретилось в базовой и личной модели — для детектора раскладки."""
+        return self.base.uni.get(w, 0) + self.user.uni.get(w, 0)
+
+    def _layout_fix(self, text: str) -> Suggestion | None:
+        """Детектор раскладки: слово в процессе набора или уже закрытое разделителем (тогда insert с ним же)."""
+        fix = self.layout.detect(text)
+        if fix is None:
+            return None
+        return Suggestion(insert=fix.insert, word=fix.insert.strip(), confidence=fix.margin, level="layout",
+                          whole_word=not fix.closed, replace=fix.erase, fix=fix)
+
+    def suggest(self, text: str, layout_text: str | None = None) -> Suggestion | None:
+        """layout_text — текст для детектора раскладки, если он короче text (после «нижней границы»: что уже
+        отменили или отклонили). Пустая строка — раскладку не проверять."""
         c2, c1, prefix, sent_start, ends_space = parse_context(text)
         if prefix and self.snippets:
             s = self._snippet(text, prefix)
             if s:
                 return s
-        if self.layout_fix and text and not ends_space:
-            s = self._layout(text, c2, c1, sent_start)
+        if self.layout_fix and text:
+            if self.layout is not None:
+                s = self._layout_fix(text if layout_text is None else layout_text)
+            else:
+                s = None if ends_space else self._layout(text, c2, c1, sent_start)
             if s:
                 return s
         if prefix and (prefix[-1] in "-'’" or prefix.isdigit()):
@@ -495,6 +516,8 @@ class Predictor:
         """Вызывать, когда слово закончено (набран разделитель). → (c2, c1, слово) выученного — для unlearn."""
         c2, c1, prefix, _, _ = parse_context(text_before_sep.rstrip())
         if prefix and not prefix.isdigit():
+            if self.layout is not None and self.layout.is_wrong_layout(prefix):
+                return None  # «ghbdtn» вместо «привет» — не слово, учить нечего
             self.user.learn(c2, c1, prefix)
             return c2, c1, prefix
         return None

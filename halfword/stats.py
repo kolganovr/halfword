@@ -11,7 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 FIELDS = ("typed", "shown", "accepted", "inserted", "saved", "type_ms", "type_n", "llm_shown", "llm_accepted",
-          "llm_saved", "long_shown", "long_accepted", "long_saved", "word_accepts")
+          "llm_saved", "long_shown", "long_accepted", "long_saved", "word_accepts", "layout_fixes", "layout_saved")
 MAX_GAP_MS = 1500
 
 
@@ -80,6 +80,17 @@ class Stats:
             d["long_saved"] += saved
         self._last_shown = None
         self._last_key = time.perf_counter()
+        self.dirty = True
+
+    def layout_fixed(self, erased: int, inserted: int, undo: bool = False):
+        """Исправление раскладки (Tab, само или клавишей): человеку не пришлось стирать erased и набирать inserted.
+
+        undo — исправление отменили, счётчики откатываются.
+        """
+        d = self._today()
+        sign = -1 if undo else 1
+        d["layout_fixes"] = max(0, d["layout_fixes"] + sign)
+        d["layout_saved"] = max(0, d["layout_saved"] + sign * (erased + inserted))
         self.dirty = True
 
     def no_caret(self, exe: str):
@@ -157,6 +168,8 @@ class Stats:
                 + (f"\n  из них в паузе ✦✦: принято {t['long_accepted']} из {t['long_shown']}, "
                    f"сэкономлено {t['long_saved']} нажатий, по словам (Ctrl+→) — {t['word_accepts']} раз"
                    if t["long_shown"] else "")
+                + (f"\n  исправлено раскладок: {t['layout_fixes']}, не пришлось стирать и набирать заново "
+                   f"{t['layout_saved']} нажатий" if t["layout_fixes"] else "")
             )
         nc = self.days.get(date.today().isoformat(), {}).get("no_caret", {})
         if nc:

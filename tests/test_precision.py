@@ -117,9 +117,13 @@ class AppGlueTest(unittest.TestCase):
         import tempfile
         from unittest import mock
         from halfword import app as A
+        from halfword.winhook import LayoutPair
         with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "send_text") as st, \
-                mock.patch.object(A, "send_key") as sk, mock.patch.object(A, "switch_layout") as sw:
+                mock.patch.object(A, "send_key") as sk, mock.patch.object(A, "switch_layout") as sw, \
+                mock.patch.object(A, "focus_hkl", return_value=0x4090409), \
+                mock.patch.object(A.App, "_later", lambda self, ms, fn, *a: None):
             me = self.make(d)
+            me.pair = LayoutPair(ru=0x4190419, en=0x4090409)
             for ch in "ghbdtn":
                 me._handle("char", ch)
             me.anchor = (100, 100, 20, me._end())
@@ -130,7 +134,7 @@ class AppGlueTest(unittest.TestCase):
             st.assert_called_once_with("привет ")
             self.assertEqual(me.buf, "привет ")
             sw.assert_called_once()
-            self.assertTrue(sw.call_args[0][1])          # на русскую
+            self.assertEqual(sw.call_args[0][0], 0x4190419)  # на русскую
 
     def test_erased_word_unlearned(self):
         import tempfile

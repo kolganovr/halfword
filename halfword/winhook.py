@@ -14,6 +14,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from .layout import KeyMap
+
 log = logging.getLogger(__name__)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -37,6 +39,11 @@ VK_LMENU, VK_RMENU = 0xA4, 0xA5
 VK_MASK = 0xE8  # неназначенная клавиша: гасит активацию меню, когда Alt отпустят после проглоченного Alt+↓
 VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL, VK_F12, VK_PACKET = 0x10, 0x11, 0x12, 0x14, 0x7B, 0xE7
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
+VK_PAUSE, VK_SCROLL = 0x13, 0x91
+HOTKEY_VK = {"pause": VK_PAUSE, "scroll_lock": VK_SCROLL}  # ручная клавиша раскладки (double_shift — два тапа Shift)
+SHIFTS = (0x10, 0xA0, 0xA1)
+DOUBLE_SHIFT_S = 0.4   # два тапа Shift подряд не дольше
+GATE_DELIMS = set(".,;:!?)]}\"'»…")  # и пробельные: после них автозамена раскладки смотрит на закрытое слово
 MODIFIERS = {0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C, 0x14, 0x90, 0x91}
 NAV = set(range(0x21, 0x29)) | {0x2D, 0x2E}  # PgUp..Down, Insert, Delete
 
@@ -94,6 +101,10 @@ user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.LoadKeyboardLayoutW.argtypes = [wt.LPCWSTR, wt.UINT]
 user32.LoadKeyboardLayoutW.restype = wt.HKL
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.GetKeyboardLayoutList.argtypes = [ctypes.c_int, ctypes.POINTER(wt.HKL)]
+user32.GetKeyboardLayoutList.restype = ctypes.c_int
+user32.MapVirtualKeyExW.argtypes = [wt.UINT, wt.UINT, wt.HKL]
+user32.MapVirtualKeyExW.restype = wt.UINT
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 kernel32.OpenProcess.restype = wt.HANDLE
 user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
@@ -170,14 +181,134 @@ def send_key(vk: int, scan: int = 0, extended: bool = False, extra: int = REPLAY
     user32.SendInput(2, arr, ctypes.sizeof(INPUT))
 
 
-def switch_layout(hwnd, cyrillic: bool):
-    """Переключить раскладку окна на русскую/английскую — после исправления «ghbdtn → привет»."""
+def send_key_shifted(vk: int, scan: int, extended: bool, shift: bool):
+    """Повторить нажатие клавишей (с Shift, если он был зажат), чтобы хук и окно перевели её в текущей раскладке."""
+    if not shift:
+        send_key(vk, scan, extended)
+        return
+    arr = (INPUT * 4)()
+    for j, (k, sc, flags) in enumerate(((VK_SHIFT, 0, 0), (vk, scan, 0), (vk, scan, 0x0002), (VK_SHIFT, 0, 0x0002))):
+        arr[j].type = 1
+        arr[j].ki = KEYBDINPUT(k, sc, flags | (0x0001 if extended and k == vk else 0), 0, REPLAY)
+    user32.SendInput(4, arr, ctypes.sizeof(INPUT))
+
+
+# --- раскладки: какие установлены, какая у окна с фокусом, переключение ---
+LANG_ENGLISH, LANG_RUSSIAN = 0x09, 0x19   # основной язык в младшем слове HKL
+_OEM_VKS = (0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF)  # VK_OEM_1…8, PLUS, COMMA, MINUS, PERIOD
+_KEY_VKS = tuple(range(0x41, 0x5B)) + _OEM_VKS + tuple(range(0x30, 0x3A))
+
+
+def primary_lang(hkl) -> int:
+    return (int(hkl or 0) & 0xFFFF) & 0x3FF
+
+
+def focus_target(fg=None):
+    """Окно с фокусом (hwndFocus потока переднего окна); нет — переданное окно верхнего уровня."""
+    gti = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    if user32.GetGUIThreadInfo(0, ctypes.byref(gti)) and gti.hwndFocus:
+        return gti.hwndFocus
+    return fg or user32.GetForegroundWindow()
+
+
+def focus_hkl(fg=None) -> int:
+    """Раскладка потока с фокусом: у окна верхнего уровня она бывает другой или ещё не переключённой."""
+    tid = user32.GetWindowThreadProcessId(focus_target(fg), None)
+    return int(user32.GetKeyboardLayout(tid) or 0)
+
+
+def installed_layouts() -> list[int]:
+    n = user32.GetKeyboardLayoutList(0, None)
+    if n <= 0:
+        return []
+    arr = (wt.HKL * n)()
+    n = user32.GetKeyboardLayoutList(n, arr)
+    return [int(h or 0) for h in arr[:max(n, 0)]]
+
+
+def _vk_char(vk: int, shift: bool, hkl: int) -> str:
+    """Символ клавиши в раскладке; пусто — мёртвая клавиша, лигатура или не печатается."""
+    state = (ctypes.c_ubyte * 256)()
+    if shift:
+        state[VK_SHIFT] = 0x80
+    buf = ctypes.create_unicode_buffer(8)
+    scan = user32.MapVirtualKeyExW(vk, 0, hkl)  # MAPVK_VK_TO_VSC
+    n = user32.ToUnicodeEx(vk, scan, ctypes.cast(state, ctypes.c_char_p), buf, 8, 0x4, hkl)
+    ch = buf.value[:1] if n == 1 else ""
+    return ch if ch and ch.isprintable() and not ch.isspace() else ""
+
+
+def build_keymap(en_hkl: int, ru_hkl: int) -> KeyMap | None:
+    """Пары символов одной клавиши в английской и русской раскладках (ToUnicodeEx, без Shift и с Shift).
+
+    Берутся пары, где с обеих сторон один печатаемый символ, а символы не повторяются; None — таблица неполная.
+    """
+    en, ru, seen_e, seen_r = [], [], set(), set()
+    for vk in _KEY_VKS:
+        for shift in (False, True):
+            e, r = _vk_char(vk, shift, en_hkl), _vk_char(vk, shift, ru_hkl)
+            if not e or not r or e == r or e in seen_e or r in seen_r:
+                continue
+            en.append(e)
+            ru.append(r)
+            seen_e.add(e)
+            seen_r.add(r)
+    if sum(1 for c in en if c.isascii() and c.isalpha()) < 52:  # a–z обоих регистров
+        return None
+    return KeyMap("".join(en), "".join(ru))
+
+
+@dataclass
+class LayoutPair:
+    """Установленные русская и английская раскладки и таблица клавиш между ними."""
+    ru: int = 0
+    en: int = 0
+    keymap: KeyMap | None = None
+    keymap_from: str = ""   # windows — ToUnicodeEx; default — запасная таблица ЙЦУКЕН/QWERTY
+    reason: str = ""        # почему исправление раскладки выключено
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.ru and self.en)
+
+    def hkl(self, cyrillic: bool) -> int:
+        return self.ru if cyrillic else self.en
+
+
+def layout_pair() -> LayoutPair:
+    """Найти установленные русскую и английскую раскладки. Нет любой из них — pair.ok == False и причина."""
     try:
-        hkl = user32.LoadKeyboardLayoutW("00000419" if cyrillic else "00000409", 0)  # без KLF_ACTIVATE
-        if hkl:
-            user32.PostMessageW(hwnd, 0x0050, 0, hkl)  # WM_INPUTLANGCHANGEREQUEST
+        hkls = installed_layouts()
+        ru = next((h for h in hkls if primary_lang(h) == LANG_RUSSIAN), 0)
+        en_all = [h for h in hkls if primary_lang(h) == LANG_ENGLISH]
+        en = next((h for h in en_all if h & 0xFFFF == 0x0409), en_all[0] if en_all else 0)
+    except Exception as e:  # noqa: BLE001 — WinAPI недоступен: исправление раскладки просто выключено
+        log.exception("не получил список раскладок")
+        return LayoutPair(reason=f"список раскладок недоступен: {e}")
+    if not ru or not en:
+        miss = " и ".join(n for n, h in (("русской", ru), ("английской", en)) if not h)
+        return LayoutPair(ru=ru, en=en, reason=f"в Windows нет {miss} раскладки")
+    km = None
+    try:
+        km = build_keymap(en, ru)
+    except Exception:
+        log.exception("таблица клавиш из ToUnicodeEx не построилась")
+    if km is None:
+        log.warning("таблица клавиш из Windows неполная — беру запасную ЙЦУКЕН/QWERTY")
+    return LayoutPair(ru=ru, en=en, keymap=km or KeyMap(), keymap_from="windows" if km else "default")
+
+
+def switch_layout(hkl: int, fg=None, top: bool = False) -> bool:
+    """Попросить окно сменить раскладку (WM_INPUTLANGCHANGEREQUEST): окно с фокусом, а top — верхнего уровня.
+
+    Только отправляет просьбу; сработала ли она, видно по focus_hkl() через ~150 мс. → принята ли в очередь.
+    """
+    try:
+        target = (fg or user32.GetForegroundWindow()) if top else focus_target(fg)
+        return bool(user32.PostMessageW(target, 0x0050, 0, hkl))
     except Exception:
         log.exception("не переключил раскладку")
+        return False
 
 
 def send_text(text: str, gap_s: float = 0.002, extra: int = MAGIC):
@@ -224,6 +355,12 @@ class Shared:
     variants: int = 0       # сколько вариантов длинной подсказки можно листать
     shown_id: int = 0       # какая именно подсказка на плашке: её и вставляем по Tab
     inserting: bool = False  # идёт вставка: нажатия откладываем, чтобы они не влезли в середину текста
+    undo_armed: bool = False  # только что сработала автозамена раскладки: ближайший Backspace — отмена, а не стирание
+    layout_gate: bool = False  # автозамена раскладки включена: после разделителя придержать ввод до решения
+    gated: bool = False        # ввод придержан разделителем; отпускает главный поток (release_held)
+    hkl_override: int = 0      # раскладка, на которую только что переключили окно (оно её ещё не применило)
+    hkl_override_until: float = 0.0
+    layout_hotkey: str = "none"  # ручная клавиша раскладки: pause | scroll_lock | double_shift | none
 
 
 class Hook:
@@ -235,6 +372,9 @@ class Hook:
         self._mask_alt = False  # Alt использован нашим сочетанием — его отпускание маскируем
         self._held: list[tuple] = []  # нажатия во время вставки: ("text", s) | ("vk", vk, scan, extended)
         self._held_lock = threading.Lock()
+        self._shift_down = False   # Shift нажат; пока _shift_clean, других клавиш до его отпускания не было
+        self._shift_clean = False
+        self._last_tap = 0.0       # когда был предыдущий чистый тап Shift (для double_shift)
         # состояние CapsLock ведём сами: GetKeyState в потоке хука не обновляется
         self.caps = bool(user32.GetKeyState(VK_CAPITAL) & 1)
         self._thread_id = 0
@@ -268,20 +408,34 @@ class Hook:
                 self._mask_alt = False
                 masked_alt_up(vk)
                 return True
+            if vk in SHIFTS:
+                self._shift_up()
             return False
         if vk == VK_CAPITAL:
             self.caps = not self.caps
-        if vk in MODIFIERS:
+        sh = self.shared
+        if vk in SHIFTS:
+            if not self._shift_down:
+                self._shift_down = self._shift_clean = True
             return False
+        self._shift_clean = False  # другая клавиша между нажатием и отпусканием Shift — это не тап
+        self._last_tap = 0.0
         ctrl, alt = _down(VK_CONTROL), _down(VK_MENU)
         shift, win = _down(VK_SHIFT), _down(VK_LWIN) or _down(VK_RWIN)
+        if vk == HOTKEY_VK.get(sh.layout_hotkey) and sh.enabled and not (ctrl or alt or win):
+            self._swallow_up.add(vk)
+            self._emit("layout_key", vk)  # ручной перевод раскладки: Pause / Scroll Lock
+            return True
+        if vk in MODIFIERS:
+            return False
         if self.shared.inserting and kb.dwExtraInfo != REPLAY and not (ctrl or alt or win):
             if self._hold(kb, vk, shift):
                 return True
+        if sh.undo_armed and not (vk == VK_BACK and not (ctrl or alt or win)):
+            sh.undo_armed = False  # любая другая клавиша снимает отмену автозамены
         if ctrl and alt and vk == VK_F12:
             self._emit("toggle")
             return True
-        sh = self.shared
         accept_vk = VK_RIGHT if sh.accept_right else VK_TAB
         if vk == accept_vk and not (ctrl or alt or shift or win):
             if sh.enabled and sh.visible and sh.shown_seq == self.seq:
@@ -307,6 +461,11 @@ class Hook:
         if vk == VK_ESCAPE:
             self._emit("dismiss")
         elif vk == VK_BACK:
+            if sh.undo_armed and sh.enabled:
+                sh.undo_armed = False
+                self._swallow_up.add(vk)
+                self._emit("layout_undo")  # Backspace сразу после автозамены раскладки: вернуть как было
+                return True
             self._emit("reset", "ctrl-bs") if (ctrl or alt) else self._emit("bs")
         elif vk == VK_RETURN:
             self._emit("enter")
@@ -317,15 +476,37 @@ class Hook:
         else:
             ch = self._translate(vk, kb.scanCode, shift, ctrl and alt)
             if ch:
+                if sh.layout_gate and sh.enabled and (ch.isspace() or ch in GATE_DELIMS):
+                    # слово закрыто: пока главный поток решает про автозамену, следующие нажатия придерживаем —
+                    # иначе они попадут в поле раньше стирания, и сотрётся не то
+                    with self._held_lock:
+                        if not sh.inserting:
+                            sh.inserting = sh.gated = True
                 self._emit("char", ch)
             elif ctrl and alt:
                 self._emit("reset", "shortcut")
         return False
 
+    def _shift_up(self):
+        """Отпустили Shift: два чистых тапа подряд за DOUBLE_SHIFT_S — ручной перевод раскладки (double_shift)."""
+        clean, self._shift_down = self._shift_clean, False
+        if not clean or self.shared.layout_hotkey != "double_shift" or not self.shared.enabled:
+            self._last_tap = 0.0
+            return
+        now = time.perf_counter()
+        if self._last_tap and now - self._last_tap <= DOUBLE_SHIFT_S:
+            self._last_tap = 0.0
+            self._emit("layout_key", 0)  # Shift в окно уже ушёл: событие без клавиши, возвращать нечего
+        else:
+            self._last_tap = now
+
     def _hold(self, kb: KBDLLHOOKSTRUCT, vk: int, shift: bool) -> bool:
         """Во время вставки: отложить нажатие (символ — текстом, остальное — клавишей). True — проглотить."""
         if vk == VK_PACKET:
             item = ("text", chr(kb.scanCode))
+        elif self.shared.gated and vk not in NAV:
+            # после разделителя: клавишей, а не буквой — если раскладку сейчас исправят, буква будет уже в новой
+            item = ("key", vk, kb.scanCode, bool(kb.flags & 1), shift)
         else:
             special = vk in NAV or vk in (VK_BACK, VK_TAB, VK_RETURN, VK_ESCAPE)
             ch = "" if special else self._translate(vk, kb.scanCode, shift, False)
@@ -343,22 +524,22 @@ class Hook:
             with self._held_lock:
                 items, self._held = self._held, []
                 if not items:
-                    self.shared.inserting = False
+                    self.shared.inserting = self.shared.gated = False
                     return
             for it in items:
                 if it[0] == "text":
                     send_text(it[1], gap_s=0, extra=REPLAY)
+                elif it[0] == "key":
+                    send_key_shifted(it[1], it[2], it[3], it[4])
                 else:
                     send_key(it[1], it[2], it[3])
 
     def _translate(self, vk: int, scan: int, shift: bool, altgr: bool) -> str:
-        # раскладка потока с фокусом: у окна верхнего уровня она бывает другой или ещё не переключённой
-        gti = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
-        if user32.GetGUIThreadInfo(0, ctypes.byref(gti)) and gti.hwndFocus:
-            tid = user32.GetWindowThreadProcessId(gti.hwndFocus, None)
+        sh = self.shared
+        if sh.hkl_override and time.perf_counter() < sh.hkl_override_until:
+            hkl = sh.hkl_override  # окну только что сменили раскладку, а оно ещё не обработало просьбу
         else:
-            tid = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
-        hkl = user32.GetKeyboardLayout(tid)
+            hkl = focus_hkl()  # раскладка потока с фокусом, а не окна верхнего уровня
         state = (ctypes.c_ubyte * 256)()
         if shift:
             state[VK_SHIFT] = 0x80
@@ -378,6 +559,8 @@ class Hook:
     def _on_mouse(self, code, wparam, lparam):
         if code == 0 and wparam in MOUSE_DOWN:
             try:
+                self._last_tap = 0.0
+                self.shared.undo_armed = False
                 self._emit("reset", "mouse")
             except Exception:
                 log.exception("ошибка в хуке мыши")
