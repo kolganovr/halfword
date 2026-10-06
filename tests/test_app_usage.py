@@ -83,6 +83,12 @@ class BannedLLMTest(unittest.TestCase):
             me.variants = [LLMResult(seq=0, text="ну ", insert="и ладно", prob=0.5, kind="long", variant=0)]
             me._on_long(LLMResult(seq=0, text="ну ", insert="и ладно, блин", prob=0.5, kind="long", variant=0))
             self.assertEqual(me.variants, [])
+            # убрали вариант перед показанным — на плашке остаётся тот же вариант
+            v = [LLMResult(seq=0, text="ну ", insert=t, prob=0.5, kind="long", variant=i)
+                 for i, t in enumerate(("и ладно", "и всё", "и хватит"))]
+            me.variants, me.vi = list(v), 1
+            me._on_long(LLMResult(seq=0, text="ну ", insert="и ладно, блин", prob=0.5, kind="long", variant=0))
+            self.assertEqual((me.variants, me.variants[me.vi]), ([v[1], v[2]], v[1]))
 
 
 if __name__ == "__main__":

@@ -115,6 +115,7 @@ class Job:
     min_prob: float = 0.4
     max_words: int = 4
     gen: int = 0
+    on_none: object = None   # quick: вызвать, если модель ответила, но ниже порога
 
 
 def prompt_window(text: str, prev_start: str | None, max_chars: int = 2000, keep: int = 350,
@@ -396,9 +397,12 @@ class LLM:
 
     # --- запросы ---
     def request(self, seq: int, text: str, prefix: str, min_prob: float, max_words: int, callback,
-                header: str = ""):
-        """Быстрый запрос во время набора; предыдущий незавершённый отменяется."""
-        self._submit(Job("quick", seq, text, prefix, callback, header, min_prob, max_words))
+                header: str = "", on_none=None):
+        """Быстрый запрос во время набора; предыдущий незавершённый отменяется.
+
+        on_none() — запрос досчитан, но подсказки нет (ниже порога); на отмену и ошибку не вызывается.
+        """
+        self._submit(Job("quick", seq, text, prefix, callback, header, min_prob, max_words, on_none=on_none))
 
     def request_long(self, seq: int, text: str, prefix: str, callback, header: str = ""):
         """Запрос в паузе: callback получает растущее продолжение, потом ветки."""
@@ -441,12 +445,15 @@ class LLM:
                     self._complete_long(job)
                     continue
                 res = self._complete(job)
+                failed = False
             except Exception as e:
                 log.debug("LLM запрос: %s", e)
-                res = None
+                res, failed = None, True
             log.debug("LLM %.0f мс: %s", self.last_ms, "есть" if res else "ниже порога/отменён")
             if res is not None:
                 job.callback(res)
+            elif job.on_none is not None and not failed and not self._stale(job):
+                job.on_none()
 
     def _stale(self, job: Job) -> bool:
         return self._gen != job.gen

@@ -942,7 +942,8 @@ async function sandbox() {
     else if (r.insert) {
       paintScreen(ovChip(r.insert, "llm"));
       llmRes.replaceChildren(h("span", { class: "muted" }, `✦ на плашке выше · вероятность ${pct(r.prob)} при пороге ${pct(r.need)} · ${num(r.ms)} мс`));
-    } else llmRes.replaceChildren(h("span", { class: "muted" }, `LLM не уверена: вероятность ниже порога ${pct(r.need)} · ${num(r.ms)} мс`));
+    } else if (r.timeout) llmRes.replaceChildren(h("span", { class: "muted" }, `LLM не ответила за ${num(Math.round(r.ms / 1000))} с — занята или запрос перебит набором; повторите`));
+    else llmRes.replaceChildren(h("span", { class: "muted" }, `LLM не уверена: вероятность ниже порога ${pct(r.need)} · ${num(r.ms)} мс`));
   }
   ta.addEventListener("input", debounce(run, 300));
   paintScreen(); paintTheme();
@@ -1003,7 +1004,8 @@ async function dict() {
   }
   async function saveSnip() {
     const a = abbr.value.trim();
-    if (!editing && a in snippets && !(await ask(`Сниппет «${a}» уже есть: «${snippets[a]}». Заменить?`, "Заменить"))) return;
+    // новое сокращение или правка с переименованием поверх чужого сниппета — спросить, иначе тот молча пропадёт
+    if (a !== editing && a in snippets && !(await ask(`Сниппет «${a}» уже есть: «${snippets[a]}». Заменить?`, "Заменить"))) return;
     const r = await act("/api/snippets", { abbr: a, text: text.value, old: editing }, editing ? "Сниппет изменён" : "Сниппет сохранён");
     if (r) { edit(null); load(); }
   }

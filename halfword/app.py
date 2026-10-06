@@ -545,8 +545,10 @@ class App:
         if self.variants and (self.variants[0].off, self.variants[0].text) != (r.off, r.text):
             self.variants, self.vi = [], 0  # ответ на новый текст вытесняет старые варианты
         if self._banned_in(r):  # вариант дорос до запрещённого слова — убираем его
+            cur = self.variants[self.vi] if self.vi < len(self.variants) else None
             self.variants = [v for v in self.variants if v.variant != r.variant]
-            self.vi = min(self.vi, max(0, len(self.variants) - 1))
+            # показанный вариант остаётся на месте, даже если убрали стоящий перед ним
+            self.vi = next((i for i, v in enumerate(self.variants) if v is cur), 0)
             self._refresh(self.last_seq)
             return
         for i, v in enumerate(self.variants):

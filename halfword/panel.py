@@ -426,7 +426,7 @@ def sandbox_llm(app, text: str) -> dict:
             return None
         _c2, _c1, prefix, _start, _sp = parse_context(text)
         llm.request(-1, text, prefix, app.cfg.llm_min_prob, app.cfg.llm_max_words,
-                    lambda r: (box.update(r=r), done.set()))
+                    lambda r: (box.update(r=r), done.set()), on_none=done.set)
         return True
 
     box: dict = {}
@@ -434,11 +434,13 @@ def sandbox_llm(app, text: str) -> dict:
     if not call_main(app, ask):
         return {"ready": False, "status": call_main(app, app._llm_status)}
     t0 = time.perf_counter()
-    done.wait(LLM_SANDBOX_WAIT)
+    answered = done.wait(LLM_SANDBOX_WAIT)
     ms = round((time.perf_counter() - t0) * 1000)
     r = box.get("r")
     need = app.cfg.llm_min_prob
-    if r is None:  # ответ ниже порога LLM не присылает
+    if not answered:  # запрос вытеснен набором, сервер упал или не уложился — это не «ниже порога»
+        return {"ready": True, "insert": None, "timeout": True, "need": need, "ms": ms}
+    if r is None:  # досчитано, но ниже порога
         return {"ready": True, "insert": None, "need": need, "ms": ms}
     return {"ready": True, "insert": r.insert, "prob": round(r.prob, 3), "need": need, "ms": ms}
 

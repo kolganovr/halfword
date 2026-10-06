@@ -400,9 +400,17 @@ class ApiTest(PanelBase):
                          {"ready": False, "status": "LLM: выключена"})
         from halfword.llm import LLMResult
         self.app.llm.ready = True
-        self.app.llm.request = lambda seq, text, prefix, p, w, cb, header="": cb(LLMResult(seq, text, "ла у тебя", 0.7))
+        self.app.llm.request = lambda seq, text, prefix, p, w, cb, header="", on_none=None: cb(LLMResult(seq, text, "ла у тебя", 0.7))
         js = self.req("POST", "/api/sandbox/llm", {"text": "Привет, как де"})[1]
         self.assertEqual((js["insert"], js["prob"]), ("ла у тебя", 0.7))
+        # досчитано, но ниже порога — не путать с «не дождались»
+        self.app.llm.request = lambda seq, text, prefix, p, w, cb, header="", on_none=None: on_none()
+        js = self.req("POST", "/api/sandbox/llm", {"text": "Привет, как де"})[1]
+        self.assertEqual((js["insert"], js.get("timeout")), (None, None))
+        self.app.llm.request = lambda *a, **kw: None  # запрос вытеснен набором — ответа нет
+        with mock.patch.object(panel, "LLM_SANDBOX_WAIT", 0.05):
+            js = self.req("POST", "/api/sandbox/llm", {"text": "Привет, как де"})[1]
+        self.assertEqual((js["insert"], js["timeout"]), (None, True))
         self.assertEqual(self.req("POST", "/api/sandbox/llm", {"text": " "})[0], 400)
 
     def test_snippet_rename(self):
