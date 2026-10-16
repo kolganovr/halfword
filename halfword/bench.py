@@ -146,16 +146,21 @@ def load_corpora(cfg, base_split: dict | None, notes: str | None = None, synthet
     tests: dict[str, str] = {}
     meta: dict[str, dict] = {}
 
+    parts: dict[str, tuple[int, int]] = {}  # источник → его кусок в train (для множителей train.w_<источник>)
     tg_train, tg_test, sp = _split(tg, base_split.get("telegram"))
     if tg_test:
+        n0 = len(train)
         train += list(iter_telegram(Path("."), cfg.tg_half_life_years, cfg.tg_weight, messages=tg_train))
+        parts["telegram"] = (n0, len(train))
         tests["telegram"] = "\n".join(t for _w, t in tg_test)[:chars]
         meta["telegram"] = {"split": sp, "train": len(tg_train), "test": len(tg_test)}
 
     cl_train, cl_test, sp = _split(cl, base_split.get("claude"))
     if cl_test:
         if cfg.claude_weight > 0:
+            n0 = len(train)
             train += [(t, cfg.claude_weight) for _w, t in cl_train]
+            parts["claude"] = (n0, len(train))
         tests["claude"] = "\n".join(t for _w, t in cl_test)[:chars]
         meta["claude"] = {"split": sp, "train": len(cl_train), "test": len(cl_test)}
 
@@ -166,6 +171,7 @@ def load_corpora(cfg, base_split: dict | None, notes: str | None = None, synthet
         train += [(read_text_file(f), 1.0) for f in tr]
         tests["notes"] = "\n".join(read_text_file(f) for f in te)[:chars]
         meta["notes"] = {"split": {}, "train": len(tr), "test": len(te)}
+    meta["_parts"] = {"split": {}, "parts": parts}
     for name, text in tests.items():
         meta[name]["chars"] = len(text)
         meta[name]["crc"] = zlib.crc32(text.encode("utf-8"))  # совпадает — значит проверочный текст тот же
@@ -195,9 +201,10 @@ def _pct(xs: list[float], q: float) -> float:
     return xs[min(len(xs) - 1, int(len(xs) * q))]
 
 
-def measure(pred_factory, text: str) -> dict:
-    """Метрики одного корпуса: числа, без текста."""
-    rows, times = [], []
+def measure(pred_factory, text: str, rows: list | None = None) -> dict:
+    """Метрики одного корпуса: числа, без текста. rows — сюда же показы (см. evaluate.simulate)."""
+    rows = [] if rows is None else rows
+    times = []
     r = simulate(pred_factory(), text, rows=rows, times=times)
     word = [x for x in rows if x[0]]
     nxt = [x for x in rows if not x[0]]
@@ -219,9 +226,15 @@ def measure(pred_factory, text: str) -> dict:
     }
 
 
-def train_model(train: list, opts: dict | None = None) -> tuple[BaseModel, dict]:
+def train_model(train: list, opts: dict | None = None, parts: dict | None = None) -> tuple[BaseModel, dict]:
+    """opts — параметры BaseModel.train; w_<источник> — множитель веса его текстов (telegram, claude)."""
+    opts = dict(opts or {})
+    for src, (a, b) in (parts or {}).items():
+        mult = opts.pop("w_" + src, None)
+        if mult is not None:
+            train = train[:a] + [(t, w * mult) for t, w in train[a:b]] + train[b:]
     t0 = time.perf_counter()
-    base = BaseModel.train(train, **(opts or {}))
+    base = BaseModel.train(train, **opts)
     secs = time.perf_counter() - t0
     size = len(pickle.dumps({"uni": base.uni, "bi": base.bi, "tri": base.tri, "case": base.case},
                             protocol=pickle.HIGHEST_PROTOCOL))
@@ -231,13 +244,14 @@ def train_model(train: list, opts: dict | None = None) -> tuple[BaseModel, dict]
 
 def run(cfg, base_split: dict | None, overrides: dict | None = None, notes: str | None = None,
         synthetic: bool = False, chars: int = CHARS, train_opts: dict | None = None,
-        corpora: tuple | None = None, model: tuple | None = None) -> dict:
+        corpora: tuple | None = None, model: tuple | None = None, rows: dict | None = None) -> dict:
     """Полный прогон: корпуса → модель → метрики. corpora/model — уже загруженные (для серии гипотез)."""
     train, tests, meta = corpora or load_corpora(cfg, base_split, notes, synthetic, chars)
-    base, minfo = model or train_model(train, train_opts)
-    out = {"model": minfo, "corpora": {}, "split": {k: v["split"] for k, v in meta.items() if v["split"]}}
+    base, minfo = model or train_model(train, train_opts, meta.get("_parts", {}).get("parts"))
+    out = {"model": minfo, "corpora": {}, "split": {k: v["split"] for k, v in meta.items() if v.get("split")}}
     for name, text in tests.items():
-        m = measure(lambda: make_predictor(base, cfg, overrides), text)
+        got = rows.setdefault(name, []) if rows is not None else None
+        m = measure(lambda: make_predictor(base, cfg, overrides), text, got)
         m.update(meta[name])
         m.pop("split", None)
         out["corpora"][name] = m
@@ -349,6 +363,10 @@ def main(argv=None):
     ap.add_argument("--train", action="append", default=[], help="параметр BaseModel.train=значение (JSON)")
     ap.add_argument("--try", dest="tries", action="append", default=[],
                     help="серия гипотез в одном прогоне: \"a=1;b=2\", параметр обучения — \"train.x=1\"")
+    ap.add_argument("--rows", help="записать показы (числа: в слове, уверенность, длина префикса, уровень, "
+                                   "длина вставки, верно, сэкономлено) в этот JSON — для подбора порогов")
+    ap.add_argument("--jobs", type=int, default=1, help="серия гипотез в N процессах")
+    ap.add_argument("--brief", action="store_true", help="серия: строка на гипотезу и корпус")
     ap.add_argument("--resplit", action="store_true", help="с --save-baseline: новая граница выборки по свежим данным")
     ap.add_argument("--speed", action="store_true")
     ap.add_argument("--baseline", help="путь к базе (по умолчанию data/ или tests/fixtures для --synthetic)")
@@ -373,8 +391,11 @@ def main(argv=None):
     split = None if (base is None or a.resplit) else base.get("split")  # граница выборки живёт в базе
     if a.tries:
         return _series(cfg, split, base, a)
-    res = run(cfg, split, overrides, a.notes, a.synthetic, a.chars, topts)
+    rows = {} if a.rows else None
+    res = run(cfg, split, overrides, a.notes, a.synthetic, a.chars, topts, rows=rows)
     print(report(res))
+    if a.rows:
+        Path(a.rows).write_text(json.dumps(rows), encoding="utf-8")
     if a.save_baseline or base is None:
         save_baseline(res, path, cfg)
         print(f"база записана: {path.name}")
@@ -390,24 +411,61 @@ def main(argv=None):
     return 0
 
 
+_W: dict = {}
+
+
+def _worker_init(cfg, split, notes, synthetic, chars):
+    _W.update(cfg=cfg, split=split, corpora=load_corpora(cfg, split, notes, synthetic, chars), models={})
+
+
+def _worker_run(spec: str) -> dict:
+    """Одна гипотеза: "a=1;b=2"; параметры обучения — с префиксом train."""
+    sets = _parse_sets([x for x in spec.split(";") if x])
+    topts = {k[6:]: v for k, v in sets.items() if k.startswith("train.")}
+    over = {k: v for k, v in sets.items() if not k.startswith("train.")}
+    key = json.dumps(topts, sort_keys=True)
+    if key not in _W["models"]:
+        _W["models"][key] = train_model(_W["corpora"][0], topts, _W["corpora"][2].get("_parts", {}).get("parts"))
+    return run(_W["cfg"], _W["split"], over, corpora=_W["corpora"], model=_W["models"][key])
+
+
+def _brief(spec: str, res: dict, base: dict | None) -> str:
+    out = []
+    for name, m in res["corpora"].items():
+        b = (base or {}).get("corpora", {}).get(name)
+        d = f" ({m['saved'] - b['saved']:+.2f} / {m['prec'] - b['prec']:+.1f})" if b else ""
+        out.append(f"{spec or 'как есть':42} {name:8} экономия {m['saved']:6.2f} верных {m['prec']:5.1f}{d} | "
+                   f"на 1000 {m['shown_1k']:5.1f} | в слове {m['word_shown']} {m['word_prec']:.1f}% "
+                   f"{m['word_saved']} | след. {m['next_shown']} {m['next_prec']:.1f}% {m['next_saved']}")
+    return "\n".join(out)
+
+
 def _series(cfg, split, base, a) -> int:
     """Несколько гипотез на одних корпусах: модель переобучается, только если меняются параметры обучения."""
-    corpora = load_corpora(cfg, split, a.notes, a.synthetic, a.chars)
-    models: dict[str, tuple] = {}
-    for spec in ["", *a.tries]:
-        sets = _parse_sets([x for x in spec.split(";") if x])
-        topts = {k[6:]: v for k, v in sets.items() if k.startswith("train.")}
-        over = {k: v for k, v in sets.items() if not k.startswith("train.")}
-        key = json.dumps(topts, sort_keys=True)
-        if key not in models:
-            models[key] = train_model(corpora[0], topts)
-        res = run(cfg, split, over, corpora=corpora, model=models[key])
+    specs = ["", *a.tries]
+    if a.jobs > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(a.jobs, initializer=_worker_init,
+                                 initargs=(cfg, split, a.notes, a.synthetic, a.chars)) as ex:
+            results = ex.map(_worker_run, specs)
+            for spec, res in zip(specs, results):
+                _print_res(spec, res, base, a.brief)
+        return 0
+    _worker_init(cfg, split, a.notes, a.synthetic, a.chars)
+    for spec in specs:
+        _print_res(spec, _worker_run(spec), base, a.brief)
+    return 0
+
+
+def _print_res(spec: str, res: dict, base: dict | None, brief: bool):
+    if brief:
+        print(_brief(spec, res, base))
+    else:
         print(f"=== {spec or 'как есть'}")
         print(report(res))
         if base:
             print("\n".join(compare(res, base)[0]))
-        sys.stdout.flush()
-    return 0
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

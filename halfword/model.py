@@ -302,6 +302,10 @@ class Predictor:
         self.next_min_tri = 0         # следующее слово без префикса: опора в триграмме не меньше
         self.short_penalty = 0.07     # +к порогу за каждый символ префикса короче 4
         self.k = 6.0                  # сглаживание интерполяции (подобрано evaluate.py)
+        # опыты на стенде (halfword.bench, отклонены: выигрыш на Claude не повторился на другом окне)
+        self.k2: float | None = None  # своё k для биграмм / триграмм (None — self.k)
+        self.k3: float | None = None
+        self.witten_bell = False      # вес уровня m/(m + k·число разных продолжений) вместо m/(m + k)
         self.banned: set[str] = set()  # не подсказывать (нижний регистр)
         self.doc_weight = 0.0         # вес слов текущего поля; 0 — выключено
         self.layout_fix = False       # подсказка при не той раскладке
@@ -497,8 +501,7 @@ class Predictor:
                     break
                 need *= 2
         btop = set(btop)
-        l2 = m2 / (m2 + self.k)
-        l3 = m3 / (m3 + self.k)
+        l2, l3 = self._lambdas(m2, len(g2), m3, len(g3))
         dw = self.doc_weight
         items = []
         for w in cand:
@@ -515,12 +518,21 @@ class Predictor:
         dist = sorted(items, key=key) if top is None else heapq.nsmallest(top, items, key=key)
         return dist, g2 + g3, g3
 
+    def _lambdas(self, m2: float, t2: int, m3: float, t3: int) -> tuple[float, float]:
+        """Вес биграмм и триграмм в интерполяции по их массе под префиксом (t — сколько разных слов)."""
+        k2 = self.k if self.k2 is None else self.k2
+        k3 = self.k if self.k3 is None else self.k3
+        if self.witten_bell:
+            return (m2 / (m2 + k2 * t2) if m2 else 0.0), (m3 / (m3 + k3 * t3) if m3 else 0.0)
+        return m2 / (m2 + k2), m3 / (m3 + k3)
+
     def surface(self, w: str) -> str:
         return self.user.case.get(w) or self.base.case.get(w) or w
 
     def _next_words(self, a: str, b: str) -> list[str]:
         self._caches()
-        key = (a, b, self.max_extra_words, self.min_conf_extra, self.min_support, self.k)
+        key = (a, b, self.max_extra_words, self.min_conf_extra, self.min_support, self.k, self.k2, self.k3,
+               self.witten_bell)
         if not self.doc_weight and key in self._next_cache:
             return list(self._next_cache[key])
         out = []
