@@ -365,7 +365,8 @@ class Predictor:
             p1 = g1.get(w, 0) / m1 if m1 else 0.0
             p2 = l2 * (g2.get(w, 0) / m2 if m2 else 0.0) + (1 - l2) * p1
             probs[w] = l3 * (g3.get(w, 0) / m3 if m3 else 0.0) + (1 - l3) * p2
-        return sorted(probs.items(), key=lambda x: -x[1]), g2 + g3, g3
+        # равные вероятности — по слову: иначе порядок зависел бы от хэшей строк и менялся от запуска к запуску
+        return sorted(probs.items(), key=lambda x: (-x[1], x[0])), g2 + g3, g3
 
     def surface(self, w: str) -> str:
         return self.user.case.get(w) or self.base.case.get(w) or w
