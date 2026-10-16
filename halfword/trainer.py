@@ -18,13 +18,13 @@ from datetime import datetime
 from pathlib import Path
 
 from . import config as C
-from .corpus import text_files
+from .corpus import read_text_file, text_files
 
 log = logging.getLogger("halfword")
 
-HOLDOUT_EVERY = 40        # каждый 40-й текстовый файл не обучает модель, а проверяет её
+HOLDOUT_EVERY = 40        # каждый 40-й текстовый файл (или сообщение, если файлов нет) не обучает модель, а проверяет её
 HOLDOUT_CHARS = 20_000    # объём проверочного текста
-CHECK_SECS = 30           # потолок на быструю проверку
+CHECK_SECS = 60           # потолок на быструю проверку одной модели
 EMIT_EVERY = 0.5          # события о ходе — не чаще 2 раз/с
 BELOW_NORMAL = 0x4000     # BELOW_NORMAL_PRIORITY_CLASS
 
@@ -47,6 +47,11 @@ def is_holdout(path: Path, root: Path, every: int) -> bool:
     и метрики разных запусков сравнимы."""
     rel = path.relative_to(root).as_posix().lower()
     return zlib.crc32(rel.encode("utf-8")) % every == 0
+
+
+def is_holdout_msg(text: str, every: int) -> bool:
+    """Отложенное сообщение: по хешу текста — новые сообщения не сдвигают выборку."""
+    return zlib.crc32(text.strip().encode("utf-8")) % every == 0
 
 
 def _tg_files(folder: Path) -> list[Path]:
@@ -88,6 +93,23 @@ def _last_metric(tag: str) -> float | None:
                 skip -= 1
                 continue
             return r["metric"]
+    return None
+
+
+ACCEPTED = ("accepted", "accepted_unchecked")
+
+
+def _current_tag() -> str | None:
+    """На какой отложенной выборке не училась модель, что сейчас в работе (с учётом откатов)."""
+    skip = 0
+    for r in history(10_000):
+        if r.get("result") == "rollback":
+            skip += 1
+        elif r.get("result") in ACCEPTED:
+            if skip:
+                skip -= 1
+                continue
+            return r.get("holdout")
     return None
 
 
@@ -145,7 +167,7 @@ def _worker(job: dict, q):
 
 
 def _run(job: dict, q):
-    from .corpus import claude_messages, iter_telegram, read_text_file, telegram_messages
+    from .corpus import claude_messages, iter_telegram, telegram_messages
     from .evaluate import simulate
     from .model import BaseModel, Predictor, UserModel
 
@@ -167,6 +189,21 @@ def _run(job: dict, q):
             pass
         emit("notes", f"Тексты, {i} из {len(train_files)}", _lerp(0, 22, i, len(train_files)))
 
+    # без файлов проверяем на отложенных сообщениях: каждое every-е по хешу текста в обучение не идёт
+    by_msg = not hold_files
+    hold_msgs: dict[str, list[tuple[str, str]]] = {"telegram": [], "claude": []}
+
+    def keep(source: str, msgs: list) -> list:
+        if not by_msg:
+            return msgs
+        out = []
+        for when, t in msgs:
+            if is_holdout_msg(t, every):
+                hold_msgs[source].append((str(when), t))
+            else:
+                out.append((when, t))
+        return out
+
     # 2. Telegram
     tg_dir = Path(P["telegram"])
     tg_files = _tg_files(tg_dir)
@@ -177,7 +214,7 @@ def _run(job: dict, q):
         emit("telegram", f"Telegram, {len(tg_files)} экспорт(ов)", 22, force=True)
         nbytes = sum(p.stat().st_size for p in tg_files)
         try:
-            msgs = telegram_messages(tg_dir)
+            msgs = keep("telegram", telegram_messages(tg_dir))
             items = list(iter_telegram(tg_dir, cfg["tg_half_life_years"], cfg["tg_weight"], messages=msgs))
             texts.extend(items)
             src["telegram"] = {"messages": len(items), "bytes": nbytes}
@@ -188,7 +225,7 @@ def _run(job: dict, q):
     # 3. сообщения Claude Code
     if cfg["claude_weight"] > 0 and Path(P["claude"]).is_dir():
         emit("claude", "Сообщения Claude", 32, force=True)
-        cm = claude_messages(Path(P["claude"]))
+        cm = keep("claude", claude_messages(Path(P["claude"])))
         texts.extend((t, cfg["claude_weight"]) for _when, t in cm)
         src["claude"] = {"messages": len(cm)}
     else:
@@ -212,32 +249,66 @@ def _run(job: dict, q):
     model.save(Path(P["new"]))
 
     # 5. быстрая проверка на отложенных текстах
-    metric, hold_chars = None, 0
     emit("check", "Проверка качества", 90, force=True)
-    if hold_files:
-        pred = Predictor(model, UserModel())
+    if by_msg:
+        tag = f"msg/{every}"
+        hold_texts = _msg_holdout(hold_msgs)
+        src["holdout_messages"] = {k: len(v) for k, v in hold_msgs.items()}
+    else:
+        tag = f"md/{every}"
+        hold_texts = (_read_or_empty(f) for f in hold_files)
+
+    def check(m, texts_, lo, hi, deadline_on=True):
+        pred = Predictor(m, UserModel())
         for k in C.PREDICTOR_KEYS:
             setattr(pred, k, cfg[k])
         deadline = time.monotonic() + CHECK_SECS
         saved = chars = 0
-        for i, f in enumerate(hold_files, 1):
+        used = []
+        for t in texts_:
             room = HOLDOUT_CHARS - chars
-            if room <= 0 or time.monotonic() > deadline:
+            if room <= 0 or (deadline_on and time.monotonic() > deadline):
                 break
-            try:
-                t = read_text_file(f)[:room]
-            except OSError:
-                continue
+            t = t[:room]
             if not t.strip():
                 continue
             r = simulate(pred, t, learn=False)
+            used.append(t)
             saved += r["saved"]
             chars += r["chars"]
-            emit("check", "Проверка качества", _lerp(90, 99, chars, HOLDOUT_CHARS))
-        hold_chars = chars
-        metric = round(saved / chars * 100, 3) if chars else None
+            emit("check", "Проверка качества", _lerp(lo, hi, chars, HOLDOUT_CHARS))
+        return (round(saved / chars * 100, 3) if chars else None), chars, used
+
+    metric, hold_chars, used = check(model, hold_texts, 90, 95)
+    # модель в работе не училась на этой выборке — меряем и её на том же тексте: сдвиг выборки не мешает сравнению
+    prev_now = None
+    if metric is not None and job.get("current_tag") == tag and Path(P["base"]).exists():
+        try:
+            prev_now = check(BaseModel.load(Path(P["base"])), used, 95, 99, deadline_on=False)[0]
+        except Exception:
+            prev_now = None
     q.put({"type": "result", "words": len(model.uni), "metric": metric, "holdout_chars": hold_chars,
-           "sources": src})
+           "holdout": tag, "prev_now": prev_now, "sources": src})
+
+
+def _read_or_empty(f: Path) -> str:
+    try:
+        return read_text_file(f)
+    except OSError:
+        return ""
+
+
+def _msg_holdout(hold: dict[str, list[tuple[str, str]]]) -> list[str]:
+    """Отложенные сообщения, свежие первыми: Claude и Telegram поровну по объёму, недобор одного добирает другой."""
+    half = HOLDOUT_CHARS // 2
+    fresh = {k: [t for _w, t in sorted(v, key=lambda x: x[0], reverse=True)] for k, v in hold.items()}
+    first, rest = [], []
+    for k in ("claude", "telegram"):
+        n = 0
+        for t in fresh.get(k, []):
+            (first if n < half else rest).append(t)
+            n += len(t)
+    return first + rest
 
 
 # --- сторона приложения ---
@@ -274,7 +345,7 @@ class Trainer:
     def last_run_ts(self) -> float:
         """Когда начался последний завершённый запуск (иначе — mtime модели, иначе 0)."""
         for r in history(100):
-            if r.get("result") in ("accepted", "rejected"):
+            if r.get("result") in (*ACCEPTED, "rejected"):
                 return float(r.get("ts", 0))
         try:
             return Path(C.BASE_MODEL).stat().st_mtime
@@ -291,7 +362,7 @@ class Trainer:
             self._rm(P["new"], str(Path(P["new"]).with_suffix(".tmp")))
             ctx = mp.get_context("spawn")
             q = ctx.Queue()
-            job = {"paths": P, "holdout_every": self.holdout_every,
+            job = {"paths": P, "holdout_every": self.holdout_every, "current_tag": _current_tag(),
                    "cfg": {k: getattr(cfg, k) for k in (*C.PREDICTOR_KEYS, "tg_half_life_years", "tg_weight",
                                                        "claude_weight")}}
             proc = ctx.Process(target=_worker, args=(job, q), daemon=True)
@@ -341,7 +412,7 @@ class Trainer:
         if proc.is_alive():
             proc.terminate()
         secs = round(time.time() - t0, 1)
-        P, tag = job["paths"], f"md/{job['holdout_every']}"
+        P, tag = job["paths"], (result or {}).get("holdout") or f"md/{job['holdout_every']}"
         rec = {"ts": round(t0, 2), "when": datetime.fromtimestamp(t0).isoformat(timespec="seconds"),
                "secs": secs, "reason": reason, "holdout": tag, "sources": None, "words": None,
                "metric": None, "prev_metric": None, "result": None, "error": None}
@@ -356,14 +427,20 @@ class Trainer:
                 rec.update(result="error", error=err)
                 ev = {"type": "error", "error": err}
             else:
-                metric, prev = result["metric"], _last_metric(tag)
+                metric, prev_now = result["metric"], result.get("prev_now")
+                prev = prev_now if prev_now is not None else _last_metric(tag)
                 ok = metric is None or prev is None or metric >= prev - gate_pp
+                # проверять было не на чем: модель подменяем, но это видно в истории и в панели
+                res = "accepted_unchecked" if metric is None else "accepted" if ok else "rejected"
                 rec.update(sources=result["sources"], words=result["words"], metric=metric, prev_metric=prev,
-                           result="accepted" if ok else "rejected")
+                           prev_how="same_text" if prev_now is not None else "history" if prev is not None else None,
+                           result=res)
+                if metric is None:
+                    log.warning("обучение: отложенных текстов нет — модель принята без проверки качества")
                 if ok:
                     self._swap_in(P)
                 ev = {"type": "done", "accepted": ok, "metric": metric, "prev_metric": prev,
-                      "words": result["words"], "secs": secs}
+                      "words": result["words"], "secs": secs, "unchecked": metric is None}
         except Exception as e:
             log.exception("итог обучения")
             rec.update(result="error", error=f"{type(e).__name__}: {e}")
@@ -435,7 +512,7 @@ class Trainer:
                     return True
             tg = _tg_files(Path(C.TELEGRAM_DIR))
             size = sum(p.stat().st_size for p in tg)
-            last = next((r for r in history(100) if r.get("result") in ("accepted", "rejected")), None)
+            last = next((r for r in history(100) if r.get("result") in (*ACCEPTED, "rejected")), None)
             old = ((last or {}).get("sources") or {}).get("telegram", {}).get("bytes")
             if old is not None and size != old:
                 return True

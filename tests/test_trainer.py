@@ -121,6 +121,56 @@ class GateTest(TrainerCase):
         self.assertTrue(self.run_and_wait()["accepted"])
 
 
+class MessageGateTest(TrainerCase):
+    """Без текстовых файлов ворота меряют на отложенных сообщениях, а без них — пишут, что проверки не было."""
+
+    def setUp(self):
+        super().setUp()
+        for f in self.vault.glob("*.md"):
+            f.unlink()
+        C.Config(claude_weight=4.0).save()
+
+    def add_claude(self, n=90):
+        from halfword.bench import synthetic_messages
+        d = Path(C.CLAUDE_DIR) / "p"
+        d.mkdir(parents=True, exist_ok=True)
+        rows = [{"type": "user", "timestamp": w.isoformat(), "message": {"content": t}}
+                for w, t in synthetic_messages("work", n)]
+        (d / "s.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+
+    def test_no_holdout_is_not_silent(self):
+        ev = self.run_and_wait()  # ни файлов, ни сообщений: проверять не на чем
+        self.assertTrue(ev["accepted"])
+        self.assertTrue(ev["unchecked"])
+        self.assertEqual(T.history(1)[0]["result"], "accepted_unchecked")
+        self.assertEqual(T._current_tag(), "msg/3")
+
+    def test_messages_holdout_and_same_text_compare(self):
+        self.add_claude()
+        ev = self.run_and_wait()
+        self.assertEqual(ev["type"], "done")
+        self.assertIsNotNone(ev["metric"])
+        h = T.history(1)[0]
+        self.assertEqual((h["holdout"], h["result"], h["prev_how"]), ("msg/3", "accepted", None))
+        held = h["sources"]["holdout_messages"]["claude"]
+        self.assertGreater(held, 0)
+        self.assertEqual(h["sources"]["claude"]["messages"] + held, 90)  # отложенные в обучение не попали
+        # второй запуск: модель в работе мерится на том же тексте, а не по записи в истории
+        self.seed_run(ts=2, holdout="msg/3", metric=99.0)  # старая метрика из истории не мешает
+        ev = self.run_and_wait()
+        h = T.history(1)[0]
+        self.assertEqual(h["prev_how"], "same_text")
+        self.assertTrue(ev["accepted"])
+        self.assertAlmostEqual(h["prev_metric"], h["metric"], places=3)  # корпус тот же — модель та же
+
+    def test_current_tag_follows_rollback(self):
+        self.seed_run(ts=1, holdout="md/3")
+        self.seed_run(ts=2, holdout="msg/3", result="accepted_unchecked", metric=None)
+        self.assertEqual(T._current_tag(), "msg/3")
+        self.seed_run(ts=3, holdout=None, result="rollback", metric=None)
+        self.assertEqual(T._current_tag(), "md/3")
+
+
 class FilesTest(TrainerCase):
     def test_rollback_swaps_files(self):
         self.base.write_bytes(b"current")
