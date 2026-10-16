@@ -9,7 +9,7 @@ import time
 
 from . import config as C
 from .corpus import read_text_file, text_files
-from .model import BaseModel, Predictor, UserModel
+from .model import BaseModel, Predictor, UserModel, parse_context
 
 SEP = " ,.;:!?)\n"
 
@@ -22,18 +22,34 @@ def split_corpus(holdout_every: int = 10):
     return [read_text_file(f) for f in train], [read_text_file(f) for f in test]
 
 
-def simulate(pred: Predictor, text: str, learn: bool = True) -> dict:
+def simulate(pred: Predictor, text: str, learn: bool = True, rows: list | None = None,
+             times: list | None = None) -> dict:
+    """rows — сюда по каждому засчитанному показу: (в слове?, уверенность, длина префикса, уровень, длина вставки,
+    верно?, сэкономлено) — только числа; times — длительность каждого suggest, мс."""
     shown = accepted = wrong = saved = 0
     last_wrong = None
     buf = ""
     i = 0
     n = len(text)
+    clock = time.perf_counter
     while i < n:
-        s = pred.suggest(buf) if buf.strip() else None
+        if buf.strip():
+            if times is not None:
+                t0 = clock()
+                s = pred.suggest(buf)
+                times.append((clock() - t0) * 1000)
+            else:
+                s = pred.suggest(buf)
+        else:
+            s = None
         if s:
             rest = text[i:]
             tail = rest[len(s.insert):len(s.insert) + 1]
             ok = rest.startswith(s.insert) and (not s.whole_word or tail == "" or tail in SEP)
+            if rows is not None and (ok or s.insert != last_wrong):
+                plen = len(parse_context(buf)[2])
+                gain = len(s.insert + (" " if s.whole_word and tail == " " else "")) - 1 if ok else 0
+                rows.append((plen > 0, round(s.confidence, 4), plen, s.level, len(s.insert), ok, gain))
             if ok:
                 accepted += 1
                 shown += 1

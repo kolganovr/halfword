@@ -1,0 +1,76 @@
+{
+ "model": {
+  "train_s": 0.1,
+  "words": 166,
+  "bi": 140,
+  "tri": 843,
+  "size_mb": 0.13,
+  "texts": 4500
+ },
+ "corpora": {
+  "telegram": {
+   "saved": 53.295,
+   "shown_1k": 205.7,
+   "prec": 50.33,
+   "shown": 2404,
+   "accepted": 1210,
+   "word_shown": 1799,
+   "word_prec": 51.92,
+   "word_saved": 4936,
+   "next_shown": 605,
+   "next_prec": 45.62,
+   "next_saved": 1292,
+   "p50_ms": 0.197,
+   "p95_ms": 0.473,
+   "max_ms": 3.06,
+   "train": 2250,
+   "test": 250,
+   "chars": 11686,
+   "crc": 1778619466
+  },
+  "claude": {
+   "saved": 56.115,
+   "shown_1k": 201.9,
+   "prec": 46.38,
+   "shown": 3601,
+   "accepted": 1670,
+   "word_shown": 3187,
+   "word_prec": 44.68,
+   "word_saved": 8209,
+   "next_shown": 414,
+   "next_prec": 59.42,
+   "next_saved": 1798,
+   "p50_ms": 0.2,
+   "p95_ms": 0.435,
+   "max_ms": 3.17,
+   "train": 2250,
+   "test": 250,
+   "chars": 17833,
+   "crc": 2457078884
+  }
+ },
+ "split": {
+  "telegram": {
+   "cut": "2026-01-11T22:30:00",
+   "end": "2026-01-13T03:33:00"
+  },
+  "claude": {
+   "cut": "2026-01-11T22:30:00",
+   "end": "2026-01-13T03:33:00"
+  }
+ },
+ "when": "2026-10-17T00:46:07",
+ "commit": "12599f5",
+ "config": {
+  "min_conf_word": 0.35,
+  "min_conf_next": 0.4,
+  "min_support": 2,
+  "short_penalty": 0.07,
+  "min_insert_chars": 2,
+  "next_min_tri": 2,
+  "doc_cache": false,
+  "tg_half_life_years": 2.0,
+  "tg_weight": 4.0,
+  "claude_weight": 4.0
+ }
+}
