@@ -17,6 +17,7 @@ def make_app(d: Path):
     me.cfg = SimpleNamespace(blacklist=[], learn=False, context_read_chars=0, llm_after_enter=True,
                              min_insert_chars=2, fast_typing_ms=0, fast_min_insert=4)  # 0 — без «быстрого набора»
     me.predictor = Predictor(BaseModel.train(["нужно сделать документ сегодня"] * 5), UserModel())
+    me.predictor.max_extra_words = 2  # подсказка из нескольких слов: журнал различает принятое и набранное
     me.stats = Stats(d / "stats.json")
     me.usage = Usage(d / "usage.jsonl")
     me.shared = W.Shared(enabled=True, shown_seq=0)
