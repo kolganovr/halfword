@@ -13,6 +13,7 @@ from halfword import app as A
 from halfword import config as C
 from halfword import usage as U
 from halfword import winhook as W
+from halfword.caret import SelectionTooLong
 from halfword.layout import KeyMap, LayoutDetector
 from halfword.model import BaseModel, Predictor, UserModel
 from halfword.winhook import LayoutPair
@@ -327,7 +328,7 @@ class LayoutAppTest(unittest.TestCase):
     def test_hotkey_with_selection(self):
         self.me = self.make("suggest")
         self.me.caret = SimpleNamespace(is_password=lambda h: False, text_before_caret=lambda n: "",
-                                        selected_text=lambda: "ghbdtn vbh")
+                                        selected_text=lambda n=2000: "ghbdtn vbh")
         self.field.text = "ghbdtn vbh"
         self.me._handle("layout_key", W.VK_PAUSE)
         self.assertEqual(self.field.ops, [("text", "привет мир")])   # поверх выделения, без стирания
@@ -340,7 +341,7 @@ class LayoutAppTest(unittest.TestCase):
     def test_hotkey_without_uia_does_not_touch_clipboard(self):
         self.me = self.make("suggest")
         self.me.caret = SimpleNamespace(is_password=lambda h: False, text_before_caret=lambda n: "",
-                                        selected_text=lambda: None)
+                                        selected_text=lambda n=2000: None)
         self.type_("ghbdtn ")
         self.me._handle("layout_key", W.VK_PAUSE)
         self.assertEqual(self.field.text, "привет ")   # выделения нет — перевели последнее слово
@@ -437,6 +438,131 @@ class LayoutAppTest(unittest.TestCase):
         self.assertEqual(p.word_count("привет"), 13)
         self.assertEqual(p.word_count("ковчег"), 1)
 
+
+    # --- T-059: находки ревью ---
+    def test_tab_switches_layout_before_insert(self):
+        self.me = self.make("suggest")
+        self.type_("ghbdtn ")
+        self.show()
+        seen = []
+        key = self.field.key
+        self.field.key = lambda *a, **k: (seen.append(list(self.switched)), key(*a, **k))
+        with mock.patch.object(A, "send_key", self.field.key):
+            self.me._handle("accept")
+        self.assertEqual(seen[0], [(RU, False)])   # раскладку попросили сменить до первого Backspace
+
+    def test_long_selection_is_not_overwritten(self):
+        self.me = self.make("suggest")
+
+        def too_long(n=2000):
+            raise SelectionTooLong(n + 1)
+
+        self.me.caret = SimpleNamespace(is_password=lambda h: False, text_before_caret=lambda n: "",
+                                        selected_text=too_long)
+        self.type_("ghbdtn ")
+        self.me._handle("layout_key", W.VK_PAUSE)
+        self.assertEqual(self.field.ops, [])        # ни набора поверх выделения, ни стирания
+        self.assertEqual(self.field.text, "ghbdtn ")
+
+    def test_hotkey_repeat_in_other_window_is_not_rollback(self):
+        self.me = self.make("suggest")
+        self.type_("ghbdtn ")
+        self.me._handle("layout_key", W.VK_PAUSE)
+        self.assertEqual(self.field.text, "привет ")
+        A.user32.GetForegroundWindow = lambda: 999   # фокус ушёл без нажатий и кликов
+        ops = len(self.field.ops)
+        self.me._handle("layout_key", W.VK_PAUSE)
+        self.assertEqual(self.field.text, "привет ")
+        self.assertEqual(len(self.field.ops), ops)
+        self.assertEqual(self.rows("undone"), [])
+
+    def test_hotkey_converts_word_from_exceptions(self):
+        self.me = self.make("suggest")
+        self.det.never = {"ghbdtn"}
+        self.det._cache.clear()
+        self.type_("ghbdtn ")
+        self.assertIsNone(self.show())               # само не предлагается
+        self.me._handle("layout_key", W.VK_PAUSE)
+        self.assertEqual(self.field.text, "привет ")  # а клавишей переводится
+
+    def test_two_escapes_put_word_into_exceptions(self):
+        self.me = self.make("suggest")
+        self.type_("ghbdtn ")
+        self.show()
+        self.me._handle("dismiss")
+        self.assertEqual(self.me.cfg.layout_never, [])
+        self.type_("ghbdtn ")
+        self.assertIsNotNone(self.show())
+        self.me._handle("dismiss")
+        self.assertEqual(self.me.cfg.layout_never, ["ghbdtn"])
+        self.assertEqual(len(self.rows("never")), 1)
+        self.type_("ghbdtn ")
+        self.assertIsNone(self.show())
+
+    def test_layout_state_keeps_no_text_and_is_capped(self):
+        self.type_("ghbdtn ")
+        self.me._handle("layout_undo")
+        raw = (Path(self.tmp.name) / "layout_state.json").read_text(encoding="utf-8")
+        self.assertNotIn("ghbdtn", raw)
+        self.assertEqual(list(json.loads(raw)["undo"].values()), [1])
+        undo = self.me.layout_state["undo"]
+        for i in range(A.LAYOUT_STATE_MAX + 5):
+            undo["%016x" % i] = 1
+        self.type_("rfr ")
+        self.me._handle("layout_undo")
+        self.assertEqual(len(self.me.layout_state["undo"]), A.LAYOUT_STATE_MAX)
+
+    def test_old_plaintext_layout_state_dropped_on_load(self):
+        (Path(self.tmp.name) / "layout_state.json").write_text(
+            json.dumps({"undo": {"ghbdtn": 1, "0123456789abcdef": 1}}), encoding="utf-8")
+        with mock.patch.object(A, "layout_pair", lambda: LayoutPair(reason="нет")):
+            self.me._init_layout()
+        self.assertEqual(self.me.layout_state["undo"], {"0123456789abcdef": 1})
+
+    def test_gate_only_where_auto_fix_runs(self):
+        self.me._update_gate()
+        self.assertTrue(self.me.shared.layout_gate)
+        self.exe_name = "windowsterminal.exe"         # программа без автозамены
+        A.user32.GetForegroundWindow = lambda: 999
+        self.me._handle("reset", "x")
+        self.assertFalse(self.me.shared.layout_gate)
+        self.exe_name = "notepad.exe"
+        A.user32.GetForegroundWindow = lambda: 1000
+        self.me._handle("reset", "x")
+        self.assertTrue(self.me.shared.layout_gate)
+        self.me.need_check = True
+        self.me.caret = SimpleNamespace(is_password=lambda h: True, text_before_caret=lambda n: "")
+        self.me._handle("char", "x")
+        self.assertFalse(self.me.shared.layout_gate)  # поле пароля
+
+    def test_auto_skipped_after_gate_watchdog_released_input(self):
+        self.me.shared.gate_expired = True
+        self.type_("ghbdtn ")
+        self.assertEqual(self.field.text, "ghbdtn ")
+        self.assertEqual(self.field.ops, [])
+
+    def test_poll_releases_gate_only_after_its_delimiter(self):
+        released = []
+        self.me.hook = SimpleNamespace(release_held=lambda force=False: released.append(self.me.shared.handling_seq))
+        self.me.events = queue.Queue()
+        self.me.cmds = queue.Queue()
+        self.me.root = SimpleNamespace(after=lambda *a: None)
+        self.me.llm = SimpleNamespace(running=True, cancel=lambda: None, ready=False)
+        self.me.llm_was_ready = False
+        self.me.cfg.llm_delay_ms = self.me.cfg.llm_pause_ms = 0
+        self.me.power_checked = self.me.last_save = 1e18
+        self.me.tray = None
+        self.me._tick = lambda: None
+        self.me._show_now = lambda: None
+        self.me.shared.inserting = self.me.shared.gated = True
+        self.me.shared.gate_seq = 3                   # хук придержал ввод на пробеле с seq 3
+        for seq, ch in ((1, "x"), (2, "y")):
+            self.me.events.put((seq, "char", ch))
+        self.me._poll()
+        self.assertEqual(released, [])               # ранние буквы гейт не отпускают
+        self.me.events.put((3, "char", " "))
+        self.me._poll()
+        self.assertEqual(released, [3])
 
 class ConfigCompatTest(unittest.TestCase):
     def load(self, d: dict) -> C.Config:
@@ -560,6 +686,91 @@ class HookLayoutKeysTest(unittest.TestCase):
             self.key(0xA0), self.key(0xA0, up=True)
             self.assertEqual([e for e in self.events() if e[0] == "layout_key"], [])
 
+
+    def test_held_after_gate_waits_for_its_event(self):
+        sent = []
+        with mock.patch.object(W, "send_key_shifted", lambda *a: sent.append(a)):
+            self.sh.layout_gate = True
+            with mock.patch.object(self.hook, "_watch_gate", lambda seq: None), \
+                    mock.patch.object(self.hook, "_translate", lambda vk, sc, sh, ag: " " if vk == 0x20 else "a"):
+                self.key(0x20)                        # пробел: гейт
+                self.assertTrue(self.key(0x41))       # буква придержана
+            gate = self.sh.gate_seq
+            self.assertEqual(gate, 1)
+            self.sh.handling_seq = gate - 1
+            self.hook.release_held()                  # главный поток ещё на прежнем событии
+            self.assertEqual(sent, [])
+            self.assertTrue(self.sh.inserting)
+            self.sh.handling_seq = gate
+            self.hook.release_held()
+            self.assertEqual(len(sent), 1)
+            self.assertFalse(self.sh.inserting or self.sh.gated)
+
+    def test_gate_watchdog_releases_stalled_input(self):
+        sent = []
+        with mock.patch.object(W, "send_key_shifted", lambda *a: sent.append(a)):
+            self.sh.layout_gate = True
+            with mock.patch.object(self.hook, "_watch_gate", lambda seq: None), \
+                    mock.patch.object(self.hook, "_translate", lambda vk, sc, sh, ag: " " if vk == 0x20 else "a"):
+                self.key(0x20)
+                self.key(0x41)
+            self.hook._gate_timeout(self.sh.gate_seq + 1)   # чужой гейт — не трогаем
+            self.assertEqual(sent, [])
+            with self.assertLogs("halfword.winhook", "INFO"):
+                self.hook._gate_timeout(self.sh.gate_seq)
+            self.assertTrue(self.sh.gate_expired)
+            self.assertEqual(len(sent), 1)
+            self.assertFalse(self.sh.gated)
+
+    def test_replayed_shift_keeps_physically_held_shift(self):
+        calls = []
+
+        def send_input(n, arr, size):
+            calls.append([(arr[j].ki.wVk, arr[j].ki.dwFlags & 0x0002) for j in range(n)])
+            return n
+
+        with mock.patch.object(W, "user32", SimpleNamespace(SendInput=send_input)):
+            with mock.patch.object(W, "_down", lambda vk: vk == W.VK_LSHIFT):
+                W.send_key_shifted(0x41, 0, False, False)   # строчная, а человек уже держит левый Shift
+                W.send_key_shifted(0x42, 0, False, True)    # заглавная под зажатым Shift — Shift не трогаем
+            with mock.patch.object(W, "_down", lambda vk: False):
+                W.send_key_shifted(0x43, 0, False, True)
+        self.assertEqual(calls[0], [(W.VK_LSHIFT, 2), (0x41, 0), (0x41, 2), (W.VK_LSHIFT, 0)])  # Shift вернули
+        self.assertEqual(calls[1], [(0x42, 0), (0x42, 2)])
+        self.assertEqual(calls[2], [(W.VK_SHIFT, 0), (0x43, 0), (0x43, 2), (W.VK_SHIFT, 2)])
+
+    def test_replayed_shift_is_not_a_tap(self):
+        self.sh.layout_hotkey = "double_shift"
+        for _ in range(2):
+            for up in (False, True):
+                kb = W.KBDLLHOOKSTRUCT(vkCode=0xA0, scanCode=0, dwExtraInfo=W.REPLAY)
+                self.hook._handle_key(kb, W.WM_KEYUP if up else W.WM_KEYDOWN)
+        self.assertEqual(self.events(), [])
+
+
+class SelectionTest(unittest.TestCase):
+    """caret.selected_text: длинное или составное выделение не обрезается молча."""
+
+    def locator(self, text, parts=1):
+        from halfword.caret import CaretLocator
+        loc = CaretLocator.__new__(CaretLocator)
+        rng = SimpleNamespace(GetText=lambda n: text[:n])
+        sel = SimpleNamespace(Length=parts, GetElement=lambda i: rng)
+        pat = SimpleNamespace(QueryInterface=lambda iface: SimpleNamespace(GetSelection=lambda: sel))
+        el = SimpleNamespace(CurrentIsPassword=False, GetCurrentPattern=lambda pid: pat)
+        loc._uia = SimpleNamespace(GetFocusedElement=lambda: el)
+        loc._mod = SimpleNamespace(UIA_TextPatternId=10014, IUIAutomationTextPattern=object)
+        return loc
+
+    def test_short_selection(self):
+        self.assertEqual(self.locator("ghbdtn\r\nvbh").selected_text(20), "ghbdtn\nvbh")
+
+    def test_long_or_multi_selection_raises(self):
+        with self.assertRaises(SelectionTooLong):
+            self.locator("x" * 30).selected_text(20)
+        with self.assertRaises(SelectionTooLong):
+            self.locator("abc", parts=2).selected_text(20)
+        self.assertEqual(self.locator("x" * 20).selected_text(20), "x" * 20)
 
 if __name__ == "__main__":
     unittest.main()

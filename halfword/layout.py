@@ -205,6 +205,7 @@ class _Tok:
     conv_z: float = 0.0
     own_z: float = 0.0
     status: str = "right"  # wrong / unsure / right / stop
+    never: bool = False    # слово в исключениях: само не исправляется, но ручная клавиша его переводит
 
 
 class LayoutDetector:
@@ -248,7 +249,7 @@ class LayoutDetector:
                 self._cache.clear()
             self._cache[chunk] = t
         return _Tok(start, start + len(chunk), t.to_cyr, t.core, t.conv, t.conv_core, t.letters,
-                    t.margin, t.conv_z, t.own_z, t.status)
+                    t.margin, t.conv_z, t.own_z, t.status, t.never)
 
     def _analyze(self, chunk: str) -> _Tok:
         t = _Tok(0, len(chunk), None, status="stop")
@@ -262,9 +263,6 @@ class LayoutDetector:
             return t
         lead = chunk.index(core)
         trail = chunk[lead + len(core):]
-        if core.lower() in self.never:
-            t.status = "right"
-            return t
         # заглавные Ж Б Ю Э Х Ъ Ё в «сщььшеЖ» — это Shift+; и т.п. другой раскладки, а не регистр
         cased = [ch for ch in core if ch.isalpha() and self.keys.convert(ch, to_cyr).isalpha()]
         if any(ch.isupper() for ch in cased[1:]) and not all(ch.isupper() for ch in cased):
@@ -299,6 +297,8 @@ class LayoutDetector:
                 t.status = "unsure"
         else:
             t.status = "unsure" if t.margin >= p.short_margin and conv_z > 0 else "right"
+        if core.lower() in self.never:
+            t.status, t.never = "right", True  # не трогать само; перевод для ручной клавиши посчитан
         return t
 
     def _own_score(self, core: str, to_cyr: bool) -> tuple[float, float]:
@@ -396,7 +396,7 @@ class LayoutDetector:
         total = sum(t.margin for t in chain)
         before = toks[: len(toks) - len(chain)]
         if before and any(t.to_cyr is not None and t.to_cyr != chain[0].to_cyr and t.status == "right"
-                          and t.own_z > 0 for t in before[-3:]):
+                          and t.own_z > 0 and not t.never for t in before[-3:]):
             total += p.ctx_bonus  # перед цепочкой уже пишут на языке перевода
         if total < p.suggest_total:
             return None
@@ -409,7 +409,8 @@ class LayoutDetector:
     def _open(self, text: str, toks: list[_Tok]) -> LayoutFix | None:
         """Недописанное слово: свой язык так не начинается, а перевод — начало частого слова."""
         t = toks[-1]
-        if t.to_cyr is None or t.end != len(text) or t.letters < 3 or not text[t.start:].endswith(t.core):
+        if (t.to_cyr is None or t.never or t.end != len(text) or t.letters < 3
+                or not text[t.start:].endswith(t.core)):
             return None
         if text[t.start:t.end] != t.core or t.conv_core != self.keys.convert(t.core, t.to_cyr):
             return None  # «(ghbd», «ghbdtn,»: подсказку посреди слова даём только для чистого слова

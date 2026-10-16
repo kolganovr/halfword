@@ -41,9 +41,11 @@ VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL, VK_F12, VK_PACKET = 0x10, 0x11, 0x12,
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 VK_PAUSE, VK_SCROLL = 0x13, 0x91
 HOTKEY_VK = {"pause": VK_PAUSE, "scroll_lock": VK_SCROLL}  # ручная клавиша раскладки (double_shift — два тапа Shift)
-SHIFTS = (0x10, 0xA0, 0xA1)
+VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1
+SHIFTS = (0x10, VK_LSHIFT, VK_RSHIFT)
 DOUBLE_SHIFT_S = 0.4   # два тапа Shift подряд не дольше
 GATE_DELIMS = set(".,;:!?)]}\"'»…")  # и пробельные: после них автозамена раскладки смотрит на закрытое слово
+GATE_MAX_S = 0.3       # главный поток не решил за это время (завис на UIA) — придержанный ввод отпускаем сами
 MODIFIERS = {0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C, 0x14, 0x90, 0x91}
 NAV = set(range(0x21, 0x29)) | {0x2D, 0x2E}  # PgUp..Down, Insert, Delete
 
@@ -182,15 +184,25 @@ def send_key(vk: int, scan: int = 0, extended: bool = False, extra: int = REPLAY
 
 
 def send_key_shifted(vk: int, scan: int, extended: bool, shift: bool):
-    """Повторить нажатие клавишей (с Shift, если он был зажат), чтобы хук и окно перевели её в текущей раскладке."""
-    if not shift:
+    """Повторить нажатие клавишей с тем Shift, что был при нажатии, чтобы хук и окно перевели её в текущей раскладке.
+
+    Shift, который человек держит сейчас, не отпускаем насовсем: если для клавиши его надо снять, после неё
+    нажимаем обратно, иначе следующие буквы под зажатым Shift выйдут строчными.
+    """
+    down = [k for k in (VK_LSHIFT, VK_RSHIFT) if _down(k)]
+    if shift == bool(down):
         send_key(vk, scan, extended)
         return
-    arr = (INPUT * 4)()
-    for j, (k, sc, flags) in enumerate(((VK_SHIFT, 0, 0), (vk, scan, 0), (vk, scan, 0x0002), (VK_SHIFT, 0, 0x0002))):
+    if shift:
+        pre, post = [(VK_SHIFT, 0)], [(VK_SHIFT, 0x0002)]
+    else:
+        pre, post = [(k, 0x0002) for k in down], [(k, 0) for k in down]
+    keys = pre + [(vk, 0), (vk, 0x0002)] + post
+    arr = (INPUT * len(keys))()
+    for j, (k, flags) in enumerate(keys):
         arr[j].type = 1
-        arr[j].ki = KEYBDINPUT(k, sc, flags | (0x0001 if extended and k == vk else 0), 0, REPLAY)
-    user32.SendInput(4, arr, ctypes.sizeof(INPUT))
+        arr[j].ki = KEYBDINPUT(k, scan if k == vk else 0, flags | (0x0001 if extended and k == vk else 0), 0, REPLAY)
+    user32.SendInput(len(keys), arr, ctypes.sizeof(INPUT))
 
 
 # --- раскладки: какие установлены, какая у окна с фокусом, переключение ---
@@ -358,6 +370,10 @@ class Shared:
     undo_armed: bool = False  # только что сработала автозамена раскладки: ближайший Backspace — отмена, а не стирание
     layout_gate: bool = False  # автозамена раскладки включена: после разделителя придержать ввод до решения
     gated: bool = False        # ввод придержан разделителем; отпускает главный поток (release_held)
+    gate_seq: int = 0          # событие разделителя, решения по которому ждёт придержанный ввод
+    handling_seq: int = 0      # какое событие сейчас обрабатывает главный поток
+    gate_expired: bool = False  # главный поток не успел за GATE_MAX_S: ввод отпущен, автозамену по этому слову не делать
+    typing: bool = False       # главный поток печатает вставку: сторож гейта ждёт её конца
     hkl_override: int = 0      # раскладка, на которую только что переключили окно (оно её ещё не применило)
     hkl_override_until: float = 0.0
     layout_hotkey: str = "none"  # ручная клавиша раскладки: pause | scroll_lock | double_shift | none
@@ -372,6 +388,7 @@ class Hook:
         self._mask_alt = False  # Alt использован нашим сочетанием — его отпускание маскируем
         self._held: list[tuple] = []  # нажатия во время вставки: ("text", s) | ("vk", vk, scan, extended)
         self._held_lock = threading.Lock()
+        self._replay_lock = threading.RLock()  # повтор придержанного: главный поток и сторож гейта по очереди
         self._shift_down = False   # Shift нажат; пока _shift_clean, других клавиш до его отпускания не было
         self._shift_clean = False
         self._last_tap = 0.0       # когда был предыдущий чистый тап Shift (для double_shift)
@@ -408,13 +425,15 @@ class Hook:
                 self._mask_alt = False
                 masked_alt_up(vk)
                 return True
-            if vk in SHIFTS:
+            if vk in SHIFTS and kb.dwExtraInfo != REPLAY:
                 self._shift_up()
             return False
         if vk == VK_CAPITAL:
             self.caps = not self.caps
         sh = self.shared
         if vk in SHIFTS:
+            if kb.dwExtraInfo == REPLAY:
+                return False  # Shift вокруг повторённой клавиши — не тап человека
             if not self._shift_down:
                 self._shift_down = self._shift_clean = True
             return False
@@ -482,6 +501,8 @@ class Hook:
                     with self._held_lock:
                         if not sh.inserting:
                             sh.inserting = sh.gated = True
+                            sh.gate_seq, sh.gate_expired = self.seq + 1, False  # seq события, которое сейчас уйдёт
+                            self._watch_gate(sh.gate_seq)
                 self._emit("char", ch)
             elif ctrl and alt:
                 self._emit("reset", "shortcut")
@@ -518,21 +539,46 @@ class Hook:
         self._swallow_up.add(vk)
         return True
 
-    def release_held(self):
-        """Конец вставки: повторить отложенные нажатия по порядку (пока повторяем, новые тоже откладываются)."""
-        while True:
-            with self._held_lock:
-                items, self._held = self._held, []
-                if not items:
-                    self.shared.inserting = self.shared.gated = False
-                    return
-            for it in items:
-                if it[0] == "text":
-                    send_text(it[1], gap_s=0, extra=REPLAY)
-                elif it[0] == "key":
-                    send_key_shifted(it[1], it[2], it[3], it[4])
-                else:
-                    send_key(it[1], it[2], it[3])
+    def release_held(self, force: bool = False):
+        """Конец вставки: повторить отложенные нажатия по порядку (пока повторяем, новые тоже откладываются).
+
+        Ввод, придержанный разделителем, ждёт решения именно по этому разделителю: пока главный поток обрабатывает
+        более ранние события (и их вставки), он остаётся придержанным. force — сторож гейта: отпустить всё.
+        """
+        sh = self.shared
+        with self._replay_lock:
+            while True:
+                with self._held_lock:
+                    if sh.gated and not force and not sh.gate_expired and sh.handling_seq < sh.gate_seq:
+                        return
+                    items, self._held = self._held, []
+                    if not items:
+                        sh.inserting = sh.gated = False
+                        return
+                for it in items:
+                    if it[0] == "text":
+                        send_text(it[1], gap_s=0, extra=REPLAY)
+                    elif it[0] == "key":
+                        send_key_shifted(it[1], it[2], it[3], it[4])
+                    else:
+                        send_key(it[1], it[2], it[3])
+
+    def _watch_gate(self, seq: int):
+        t = threading.Timer(GATE_MAX_S, self._gate_timeout, (seq,))
+        t.daemon = True
+        t.start()
+
+    def _gate_timeout(self, seq: int):
+        """Главный поток не решил по разделителю за GATE_MAX_S: набор не должен зависать — отпустить самим."""
+        sh = self.shared
+        while sh.typing:  # идёт наша вставка: она сама отпустит ввод в конце
+            time.sleep(0.01)
+        with self._held_lock:
+            if not (sh.gated and sh.gate_seq == seq):
+                return
+            sh.gate_expired = True
+        log.info("решение по раскладке не успело за %.0f мс — придержанный ввод отпущен", GATE_MAX_S * 1000)
+        self.release_held(force=True)
 
     def _translate(self, vk: int, scan: int, shift: bool, altgr: bool) -> str:
         sh = self.shared

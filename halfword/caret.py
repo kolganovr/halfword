@@ -11,6 +11,10 @@ import ctypes.wintypes as wt
 import logging
 
 log = logging.getLogger(__name__)
+
+
+class SelectionTooLong(Exception):
+    """Выделение длиннее max_chars или из нескольких кусков: прочитать его целиком нельзя."""
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 
@@ -141,7 +145,8 @@ class CaretLocator:
 
     def selected_text(self, max_chars: int = 2000) -> str | None:
         """Выделенный текст в поле с фокусом (UIA TextPattern). Пустая строка — выделения нет;
-        None — UIA недоступна или поле не отдаёт текст (тогда считаем, что выделения нет)."""
+        None — UIA недоступна или поле не отдаёт текст (тогда считаем, что выделения нет).
+        Длиннее max_chars или несколько кусков — SelectionTooLong: перевод части стёр бы остальное."""
         if not self._uia:
             return None
         m = self._mod
@@ -155,11 +160,14 @@ class CaretLocator:
             sel = pat.QueryInterface(m.IUIAutomationTextPattern).GetSelection()
             if not sel or not sel.Length:
                 return ""
-            text = sel.GetElement(0).GetText(max_chars)
-            return text.replace("\r\n", "\n").replace("\r", "\n")
+            parts = sel.Length
+            text = sel.GetElement(0).GetText(max_chars + 1)  # на символ больше: так видно, что выделение длиннее
         except Exception as e:
             log.debug("UIA selection: %s", e)
-        return None
+            return None
+        if parts > 1 or len(text) > max_chars:
+            raise SelectionTooLong(len(text))
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
     # --- пароль ---
     def is_password(self, hwnd) -> bool:

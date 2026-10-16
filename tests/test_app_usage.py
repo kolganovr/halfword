@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from halfword import app as A
+from halfword import winhook as W
 from halfword.model import BaseModel, Predictor, UserModel
 from halfword.stats import Stats
 from halfword.usage import Usage, load
@@ -18,12 +19,12 @@ def make_app(d: Path):
     me.predictor = Predictor(BaseModel.train(["нужно сделать документ сегодня"] * 5), UserModel())
     me.stats = Stats(d / "stats.json")
     me.usage = Usage(d / "usage.jsonl")
-    me.shared = SimpleNamespace(enabled=True, variants=0, visible=False, shown_seq=0, shown_id=0, inserting=False)
+    me.shared = W.Shared(enabled=True, shown_seq=0)
     me.overlay = SimpleNamespace(show=lambda *a, **k: None, hide=lambda: None)
     me.caret = SimpleNamespace(is_password=lambda h: False, text_before_caret=lambda n: "",
                                locate=lambda h: (100, 100, 20, "test"))
     me.llm = SimpleNamespace(running=True)
-    me.hook = SimpleNamespace(release_held=lambda: None)
+    me.hook = SimpleNamespace(release_held=lambda force=False: None)
     me.key_hint = "Tab"
     me.buf, me.buf_off, me.fg, me.exe = "", 0, None, ""
     me.history, me.shown_id = {}, 0

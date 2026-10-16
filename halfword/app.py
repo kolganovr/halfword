@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -16,7 +17,7 @@ import webbrowser
 
 from . import config as C
 from . import panel
-from .caret import CaretLocator
+from .caret import CaretLocator, SelectionTooLong
 from .layout import LayoutDetector
 from .llm import LLM, on_ac_power
 from .model import DOC_WEIGHT, WORD_CH, WORD_RE, BaseModel, Predictor, Suggestion, UserModel, parse_context
@@ -24,9 +25,9 @@ from .overlay import Overlay
 from .stats import Stats
 from .trainer import Trainer
 from .usage import MissWatch, Usage, layout_info
-from .winhook import (LANG_ENGLISH, LANG_RUSSIAN, MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared, focus_hkl,
-                      layout_pair, primary_lang, process_name, send_key, send_text, switch_layout, user32,
-                      window_header)
+from .winhook import (GATE_DELIMS, LANG_ENGLISH, LANG_RUSSIAN, MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared,
+                      focus_hkl, layout_pair, primary_lang, process_name, send_key, send_text, switch_layout,
+                      user32, window_header)
 
 log = logging.getLogger("halfword")
 DEBUG = os.environ.get("HALFWORD_DEBUG") == "1"  # в лог пишется и текст подсказок — только для отладки
@@ -38,11 +39,12 @@ SYNC_CHARS = 64        # сколько текста поля сверять с 
 SYNC_LAG = 3           # поле может отставать от буфера на столько символов (приложение ещё не вставило)
 SYNC_GIVE_UP = 5       # столько расхождений подряд — поле отдаёт не тот текст, в этом окне больше не сверяем
 CYR_RE = re.compile(r"[А-Яа-яЁё]")
-AUTO_DELIMS = set(".,;:!?)]}\"'»…")  # кроме пробельных: символы, после которых автозамена раскладки смотрит на слово
 LAYOUT_TAIL = 400      # сколько символов текста отдаём детектору раскладки (смотрит на последние слова)
 SWITCH_CHECK_MS = 150  # через сколько проверить, что окно сменило раскладку
 SWITCH_OVERRIDE_S = 0.4  # столько хук переводит нажатия в новой раскладке, не спрашивая окно
 MANUAL_UNDO_S = 3.0    # повторная ручная клавиша за это время откатывает перевод
+SELECTION_MAX = 2000   # выделение длиннее ручная клавиша не переводит: целиком его из поля не прочитать
+LAYOUT_STATE_MAX = 500  # столько слов со счётчиком отказов храним (самые давние забываем)
 
 
 def typed_after(buf: str, buf_off: int, text: str, off: int) -> str | None:
@@ -228,7 +230,12 @@ class App:
         if getattr(self, "shared", None) is None:
             return  # ещё в __init__: выставится, когда загрузится детектор
         self.shared.layout_gate = (self._layout_mode() == "auto" and self.layout is not None
-                                   and self.pair is not None and self.pair.ok)
+                                   and self.pair is not None and self.pair.ok and not self._auto_off())
+
+    def _auto_off(self) -> bool:
+        """Автозамены в этом окне нет: программа в списке без автозамены, чёрный список или поле пароля."""
+        return (getattr(self, "blocked", False) or getattr(self, "password", False)
+                or getattr(self, "exe", "") in getattr(self.cfg, "layout_auto_off", ()))
 
     def _init_layout(self):
         """Раскладки из Windows и детектор: словари грузятся ~1.4 с, поэтому в потоке; объект живёт до выхода."""
@@ -237,6 +244,9 @@ class App:
             self.layout_state = st if isinstance(st, dict) else {}
         except (OSError, ValueError):
             self.layout_state = {}
+        undo = self.layout_state.get("undo")
+        if isinstance(undo, dict):  # ключи до T-059 были самим текстом — их не храним
+            self.layout_state["undo"] = {k: v for k, v in undo.items() if re.fullmatch(r"[0-9a-f]{16}", k)}
         self.pair = layout_pair()
         if not self.pair.ok:
             log.warning("исправление раскладки выключено: %s", self.pair.reason)
@@ -353,8 +363,7 @@ class App:
     def _layout_auto(self, ch: str):
         """Автозамена: слово закрыто разделителем, детектор уверен — исправить и взвести отмену Backspace."""
         if (self._layout_mode() != "auto" or self.layout is None or self.pair is None or not self.pair.ok
-                or self.exe in getattr(self.cfg, "layout_auto_off", ())
-                or not (ch.isspace() or ch in AUTO_DELIMS)):
+                or self._auto_off() or not (ch.isspace() or ch in GATE_DELIMS)):
             return
         if self.pending_reload:
             self._sync_field()  # контекст после клика: сначала настоящий текст поля
@@ -366,6 +375,8 @@ class App:
         if field and not field_agrees(self.buf, field):
             log.debug("автозамена раскладки пропущена: поле не совпадает с буфером")
             return
+        if self.shared.gate_expired:
+            return  # сторож гейта уже отпустил набранное после разделителя: стирать вслепую нельзя
         def arm(prev):  # Backspace, придержанный с пробела, повторится в конце вставки — он уже отмена
             self.undo = {"fix": fix, "prev": prev or self.pair.hkl(not fix.to_cyr), "end": self._end()}
             self.shared.undo_armed = True
@@ -391,7 +402,7 @@ class App:
         info = layout_info(fix.original, fix.to_cyr, fix.words, self._layout_mode(), "auto")
         self.usage.layout_done("undone", info, self.exe)
         self.stats.layout_fixed(fix.erase, len(fix.insert), undo=True)
-        self._count_undo(fix, info)
+        self._count_reject(fix, info)
         return True
 
     def _never_words(self, original: str) -> list[str]:
@@ -403,14 +414,20 @@ class App:
                 words.append(core)
         return words
 
-    def _count_undo(self, fix, info: dict):
-        """Вторая отмена того же слова — в исключения (layout_never)."""
-        key = "".join(fix.original.lower().split())
+    def _count_reject(self, fix, info: dict):
+        """Второй отказ от исправления того же слова (отмена автозамены или Esc на плашке) — в исключения (layout_never).
+
+        Счётчики хранятся по хэшу слова, а не по тексту, и не больше LAYOUT_STATE_MAX: набранное на диск не пишем.
+        """
+        key = hashlib.sha1("".join(fix.original.lower().split()).encode("utf-8")).hexdigest()[:16]
         if self.layout_state is None:
             self.layout_state = {}
         undo = self.layout_state.setdefault("undo", {})
-        undo[key] = undo.get(key, 0) + 1
-        if undo[key] >= 2:
+        n = undo.pop(key, 0) + 1   # заново в конец: самые давние отказы забываются первыми
+        undo[key] = n
+        while len(undo) > LAYOUT_STATE_MAX:
+            undo.pop(next(iter(undo)))
+        if n >= 2:
             undo.pop(key)
             new = [w for w in self._never_words(fix.original) if w not in self.cfg.layout_never]
             if new:
@@ -434,7 +451,7 @@ class App:
             self._pass_through("layout_key", (vk,))
             return True
         mode = self._layout_mode()
-        if prev_manual and time.time() - prev_manual["t"] <= MANUAL_UNDO_S:
+        if prev_manual and time.time() - prev_manual["t"] <= MANUAL_UNDO_S and prev_manual["fg"] == self.fg:
             m = prev_manual
             self._hide()
             self._switch_hkl(m["prev"])  # до вставки, как и при исправлении
@@ -448,7 +465,11 @@ class App:
             self.stats.layout_fixed(len(m["original"]), len(m["insert"]), undo=True)
             return True
         get_sel = getattr(self.caret, "selected_text", None)
-        sel = get_sel() if get_sel else None  # нет UIA или поле не отдаёт текст — выделения нет, буфер обмена не трогаем
+        try:
+            sel = get_sel(SELECTION_MAX) if get_sel else None  # нет UIA или поле не отдаёт текст — выделения нет
+        except SelectionTooLong:
+            log.info("выделение длиннее %s симв. или из нескольких кусков — раскладку не перевожу", SELECTION_MAX)
+            return True  # набор поверх стёр бы непрочитанный остаток
         if sel:
             conv, to_cyr = det.convert_text(sel)
             if conv == sel:
@@ -465,7 +486,7 @@ class App:
             self.pending_reload = True   # текст вокруг выделения неизвестен — перечитаем из поля
             self.sync_due = False
             self.manual = {"t": time.time(), "insert": conv, "original": sel, "to_cyr": to_cyr,
-                           "words": len(sel.split()), "prev": prev}
+                           "words": len(sel.split()), "prev": prev, "fg": self.fg}
             return True
         text = self._layout_text()
         fix = det.convert_last(text) if text else None
@@ -473,7 +494,7 @@ class App:
             return True
         _row, prev = self._apply_layout(fix, "hotkey")
         self.manual = {"t": time.time(), "insert": fix.insert, "original": fix.original, "to_cyr": fix.to_cyr,
-                       "words": fix.words, "prev": prev}
+                       "words": fix.words, "prev": prev, "fg": self.fg}
         return True
 
     def _pass_through(self, kind: str, args: tuple):
@@ -515,11 +536,12 @@ class App:
         try:
             while True:
                 ev = self.events.get_nowait()
-                self.last_seq = ev[0]
+                self.last_seq = self.shared.handling_seq = ev[0]
                 try:
                     typed = self._handle(ev[1], *ev[2:]) or typed
                 finally:
-                    if self.shared.gated:  # решение по закрытому слову принято — придержанный ввод отпускаем
+                    # решение по разделителю, на котором хук придержал ввод, принято — отпускаем; ранние события — нет
+                    if self.shared.gated and ev[0] >= self.shared.gate_seq:
                         self.hook.release_held()
                 if ev[1] == "char":
                     self.typed_exe = self.exe  # для пунктов трея «выключить в <программе>»
@@ -600,6 +622,8 @@ class App:
             self.sync_ok, self.sync_miss = True, 0
             self.exe = process_name(hwnd)
             self.blocked = self.exe in self.cfg.blacklist
+            self.password = False
+            self._update_gate()
             self.usage.reset("window")
             log.debug("окно: %s%s", self.exe, " (чёрный список)" if self.blocked else "")
         if not self.shared.enabled or self.blocked:
@@ -618,6 +642,7 @@ class App:
             if self.need_check:
                 self.need_check = False
                 self.password = self.caret.is_password(hwnd)
+                self._update_gate()
                 if self.password:
                     log.debug("поле пароля — пропускаю")
                 elif not self.buf:
@@ -662,8 +687,12 @@ class App:
             self.need_check = True
             self.pending_reload = False
         elif kind == "dismiss":
-            if self.suggestion is not None and self.suggestion.level == "layout":
+            s = self.suggestion
+            if s is not None and s.level == "layout":
                 self.layout_floor = self._end()  # отклонённое исправление детектор не предлагает снова
+                if s.fix is not None and self.layout is not None:
+                    # слово, которое детектор считает опечаткой, не учится: без счёта отказов плашка была бы вечной
+                    self._count_reject(s.fix, self._layout_info(s, s.fix.to_cyr))
             self.dismissed = True
             self.usage.dismiss()
         elif kind == "layout_undo":
@@ -708,20 +737,19 @@ class App:
         last = chunk == s.insert.rstrip()
         text = chunk + (" " if last and s.whole_word else "")
         self.overlay.hide()
-        self._insert(text, erase=s.replace)
-        row = None
-        if s.replace:
-            self.buf = self.buf[:max(0, len(self.buf) - s.replace)]
         if s.level == "layout":
             cyr = s.fix.to_cyr if s.fix else bool(CYR_RE.search(text))
             info = self._layout_info(s, cyr)
             row = self.usage.layout_done("accepted", info, self.exe)
             self.usage.reset("layout")
             self.stats.layout_fixed(s.replace, len(text))
-        else:
+            # до вставки, как в _apply_layout: нажатия во время вставки хук переведёт уже в новой раскладке
+            self._switch(cyr, row)
+        self._insert(text, erase=s.replace)
+        if s.replace:
+            self.buf = self.buf[:max(0, len(self.buf) - s.replace)]
+        if s.level != "layout":
             self.usage.accept(text)
-        if s.level == "layout":
-            self._switch(cyr, row)  # дальше печатать в нужной раскладке
         # учим только слова, после которых уже стоит пробел; недописанное (основа, кусок по Ctrl+→)
         # выучится, когда допечатаешь его и поставишь разделитель
         tmp = self.buf
@@ -757,7 +785,7 @@ class App:
         s = self._long_suggestion()
         if not s:
             lt = self._layout_text()
-            ng = self.predictor.suggest(self.buf) if lt is None else self.predictor.suggest(self.buf, layout_text=lt)
+            ng = self.predictor.suggest(self.buf, layout_text=lt)
             s = ng if ng and ng.level == "layout" else self._merge(ng, self._llm_suggestion())
         if s and s.level not in ("long", "layout", "snippet") and not self._worth_showing(s):
             s = None
@@ -1088,12 +1116,13 @@ class App:
 
         erase — сначала стереть столько символов (Backspace с меткой MAGIC: хук их не считает набором).
         """
-        self.shared.inserting = True
+        self.shared.inserting = self.shared.typing = True
         try:
             for _ in range(erase):
                 send_key(VK_BACK, extra=MAGIC)
             send_text(text)
         finally:
+            self.shared.typing = False
             self.hook.release_held()
 
     # --- управление ---
