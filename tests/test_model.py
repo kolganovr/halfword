@@ -43,6 +43,26 @@ class ModelTest(unittest.TestCase):
             p.learn_from("Привет, как делишки ")
         self.assertTrue(p.suggest("Привет, как де").insert.startswith("лишки"))
 
+    def test_incremental_caches_match_fresh(self):
+        """Кэши личного словаря догоняются по журналу правок — подсказки как у построенных заново."""
+        import random
+        rng = random.Random(3)
+        words = ["дела", "делишки", "делать", "документ", "домой", "дом", "казань", "кот", "котик", "как"]
+        p = Predictor(BaseModel.train(CORPUS), UserModel())
+        fresh = Predictor(p.base, p.user)
+        for i in range(400):
+            w = rng.choice(words)
+            if rng.random() < 0.8:
+                p.learn_from(f"{rng.choice(words)} {w} ")
+            else:
+                p.user.unlearn("<s>", rng.choice(words), w)
+            text = rng.choice(["Привет, как ", "Поездка в ", "", "ну "]) + rng.choice(words)[:rng.randint(0, 3)]
+            if not text.strip():
+                continue
+            fresh._ckey = None  # заставить строить кэши заново
+            a, b = p.suggest(text), fresh.suggest(text)
+            self.assertEqual(a and (a.insert, a.confidence), b and (b.insert, b.confidence), (i, text))
+
     def test_roundtrip(self):
         import tempfile, pathlib
         d = pathlib.Path(tempfile.mkdtemp())

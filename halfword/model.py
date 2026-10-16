@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import bisect
+import heapq
 import os
 import json
 import pickle
@@ -168,6 +169,8 @@ class UserModel:
         self.case: dict[str, str] = {}
         self.decayed_at = 0.0
         self.dirty = False
+        self.version = 0  # растёт при каждой правке счётов: по нему предсказатель сбрасывает кэши
+        self.changes: list[tuple[int, str | None, int]] = []  # (версия, слово, ±1); None — правка целиком
 
     def learn(self, c2: str, c1: str, word: str):
         if len(word) > MAX_WORD_LEN:
@@ -179,6 +182,7 @@ class UserModel:
         if word != w and not word.isdigit() and c1 != BOS:
             self.case[w] = word
         self.dirty = True
+        self._changed(w, 1)
 
     def unlearn(self, c2: str, c1: str, word: str):
         """Откатить одно learn: слово стёрли или переписали сразу после пробела."""
@@ -193,6 +197,7 @@ class UserModel:
             if key is not None and not c:
                 del table[key]
         self.dirty = True
+        self._changed(w, -1)
 
     def decay(self, now: float):
         """Забывание: счёты тают вдвое за USER_HALF_LIFE_DAYS, крохи выбрасываются."""
@@ -215,6 +220,7 @@ class UserModel:
                     del table[k]
         self.decayed_at = now
         self.dirty = True
+        self._changed(None, 0)
 
     def forget(self, word: str) -> int:
         """Забыть слово: убрать из всех счётчиков (и как продолжение, и как контекст). → сколько записей убрано."""
@@ -229,7 +235,14 @@ class UserModel:
                     del table[k]
                     n += 1
         self.dirty = self.dirty or n > 0
+        self._changed(None, 0)
         return n
+
+    def _changed(self, w: str | None, delta: int):
+        self.version += 1
+        self.changes.append((self.version, w, delta))
+        if len(self.changes) > 256:
+            del self.changes[:128]
 
     def save(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,43 +311,142 @@ class Predictor:
         self._doc_uni: Counter = Counter()
         self._doc_bi: dict[str, Counter] = {}
         self._uni_cache: dict[str, list[str]] = {}
+        self._ckey = self._cver = None
         self._uni_top("")  # прогрев: самый дорогой запрос
 
     def _uni_top(self, prefix: str) -> list[str]:
+        if not prefix:  # по всему словарю — самый дорогой запрос, считается раз на модель
+            top = getattr(self.base, "_top_all", None)
+            if top is None:
+                top = self.base._top_all = heapq.nlargest(40, self.base.vocab, key=self.base.uni.__getitem__)
+            return top
         top = self._uni_cache.get(prefix)
         if top is None:
             lo, hi = self.base.prefix_range(prefix)
-            words = self.base.vocab[lo:hi]
-            top = sorted(words, key=self.base.uni.__getitem__, reverse=True)[:40]
+            top = heapq.nlargest(40, self.base.vocab[lo:hi], key=self.base.uni.__getitem__)
             if len(self._uni_cache) > 5000:
                 self._uni_cache.clear()
             self._uni_cache[prefix] = top
         return top
 
+    # --- кэши по личному словарю: живут, пока не поменялись счёты, база или запреты ---
+    def _caches(self):
+        """Набрал слово — догоняем кэши по журналу правок (поправить пару записей дешевле, чем строить заново)."""
+        u = self.user
+        key = (id(u), id(self.base), id(self.banned), len(self.banned))
+        if key == self._ckey and u.version == self._cver:
+            return
+        if key == self._ckey and self._replay(u):
+            self._cver = u.version
+            self._next_cache = {}
+            return
+        self._ckey, self._cver = key, u.version
+        self._ukeys: list[str] | None = None  # личный словарь по алфавиту — для bisect, как у базы
+        self._upos: dict[str, int] = {}       # слово → место в счётчике (порядок сложения масс)
+        self._unext = 0
+        self._uent: dict[str, tuple] = {}     # префикс → (масса униграмм, личные слова по убыванию счёта, все ли)
+        self._next_cache: dict[tuple, list[str]] = {}
+
+    def _replay(self, u: UserModel) -> bool:
+        todo = [c for c in u.changes if c[0] > self._cver]
+        if len(todo) != u.version - self._cver or any(w is None for _v, w, _d in todo):
+            return False
+        for _v, w, delta in todo:
+            self._apply(w, delta)
+        return True
+
+    def _apply(self, w: str, delta: int):
+        """Счёт слова w изменился на delta: поправить индекс и записи префиксов w."""
+        u = self.user.uni
+        n = u.get(w, 0)
+        new = delta > 0 and n == delta  # слово только что появилось — в конце счётчика
+        if self._ukeys is not None:
+            if n > 0 and w not in self._upos:
+                bisect.insort(self._ukeys, w)
+                self._upos[w] = self._unext
+                self._unext += 1
+            elif n <= 0 and w in self._upos:
+                del self._ukeys[bisect.bisect_left(self._ukeys, w)]
+                del self._upos[w]
+        eligible = not (w.startswith("<") or w in self.banned)
+        key = lambda x: (-u[x], x)
+        for i in range(len(w) + 1):
+            k = w[:i]
+            ent = self._uent.get(k)
+            if ent is None:
+                continue
+            mass, lst, full = ent
+            if new:
+                mass += u[w] * USER_WEIGHT  # тот же шаг, что был бы последним в сумме по счётчику
+            else:
+                mass = self._user_mass(k)
+            if eligible:
+                if w in lst:
+                    if delta < 0 and not full:
+                        del self._uent[k]  # слово опустилось — на его место может встать любое вне списка
+                        continue
+                    lst = sorted((x for x in lst if x != w or n > 0), key=key)
+                elif n > 0 and (full or delta > 0 and lst and key(w) < key(lst[-1])):
+                    lst = sorted(lst + [w], key=key)
+                    if not full:
+                        lst.pop()
+            self._uent[k] = (mass, lst, full)
+
+    def _user_mass(self, p: str) -> float:
+        lo, hi = self.base.prefix_range(p)
+        mass = float(self.base.cum[hi] - self.base.cum[lo])
+        u = self.user.uni
+        for w in self._user_words(p):  # тот же порядок сложения, что при переборе счётчика: масса совпадает до бита
+            mass += u[w] * USER_WEIGHT
+        return mass
+
+    def _user_words(self, p: str) -> list[str]:
+        """Личные слова под префиксом в порядке счётчика (без перебора всего словаря)."""
+        if not p:
+            return list(self.user.uni)
+        if self._ukeys is None:
+            self._ukeys = sorted(self.user.uni)
+            self._upos = {w: i for i, w in enumerate(self.user.uni)}
+            self._unext = len(self._upos)
+        lo = bisect.bisect_left(self._ukeys, p)
+        hi = bisect.bisect_left(self._ukeys, p + "\uffff")
+        return sorted(self._ukeys[lo:hi], key=self._upos.__getitem__)
+
+    def _user_entry(self, p: str, need: int) -> tuple:
+        """→ (масса униграмм под префиксом: база + личное, личные слова по убыванию счёта, список полный?).
+
+        По счёту хранятся первые need слов (не меньше 64); не хватило — список строится заново длиннее."""
+        ent = self._uent.get(p)
+        if ent is not None and (ent[2] or len(ent[1]) >= need):
+            return ent
+        u = self.user.uni
+        mass = self._user_mass(p)
+        ok = [w for w in self._user_words(p) if not (w.startswith("<") or w in self.banned)]
+        n = max(need, 64)
+        key = lambda w: (-u[w], w)
+        full = len(ok) <= n
+        top = sorted(ok, key=key) if full else heapq.nsmallest(n, ok, key=key)
+        if len(self._uent) > 2000:
+            self._uent.clear()
+        ent = self._uent[p] = (mass, top, full)
+        return ent
+
     def _level(self, level: str, key: str, prefix: str) -> tuple[Counter, float]:
-        """Счёты слов под префиксом на уровне и полная масса под префиксом."""
+        """Счёты слов под префиксом на уровне bi/tri и полная масса под префиксом (униграммы — в _dist)."""
         got: Counter = Counter()
         mass = 0.0
-        if level == "uni":
-            lo, hi = self.base.prefix_range(prefix)
-            mass = float(self.base.cum[hi] - self.base.cum[lo])
-            for w in self._uni_top(prefix):
-                got[w] = self.base.uni[w]
-            utab = self.user.uni
-            dtab = self._doc_uni
-        else:
-            table = self.base.tri if level == "tri" else self.base.bi
-            if key in table:
-                total, lst = table[key]
-                for w, n in lst:
-                    if w.startswith(prefix):
-                        got[w] += n
-                stored = sum(n for _, n in lst)
-                matched = sum(got.values())
-                # хвост, не попавший в топ, распределяем пропорционально
-                mass = matched + (total - stored) * (matched / stored if stored else 0)
-            utab = (self.user.tri if level == "tri" else self.user.bi).get(key, {})
-            dtab = self._doc_bi.get(key, {}) if level == "bi" else {}
+        table = self.base.tri if level == "tri" else self.base.bi
+        if key in table:
+            total, lst = table[key]
+            for w, n in lst:
+                if w.startswith(prefix):
+                    got[w] += n
+            stored = sum(n for _, n in lst)
+            matched = sum(got.values())
+            # хвост, не попавший в топ, распределяем пропорционально
+            mass = matched + (total - stored) * (matched / stored if stored else 0)
+        utab = (self.user.tri if level == "tri" else self.user.bi).get(key, {})
+        dtab = self._doc_bi.get(key, {}) if level == "bi" else {}
         for w, n in utab.items():
             if w.startswith(prefix):
                 got[w] += n * USER_WEIGHT
@@ -353,28 +465,67 @@ class Predictor:
         dist, support, _g3 = self._dist(c2, c1, prefix)
         return dist, support
 
-    def _dist(self, c2: str, c1: str, prefix: str) -> tuple[list[tuple[str, float]], Counter, Counter]:
+    def _dist(self, c2: str, c1: str, prefix: str, top: int | None = None
+              ) -> tuple[list[tuple[str, float]], Counter, Counter]:
+        """top — нужны только первые top слов. Тогда из личных слов, которых нет ни в би/триграммах, ни в топе базы,
+        ни в поле, считаются только top самых частых: у остальных вероятность — та же доля униграммы, только меньше.
+        None — все слова (песочница)."""
         p = prefix.lower()
-        g1, m1 = self._level("uni", "", p)
+        self._caches()
         g2, m2 = self._level("bi", c1, p)
         g3, m3 = self._level("tri", c2 + " " + c1, p)
+        u, bu, banned = self.user.uni, self.base.uni, self.banned
+        m1 = self._user_entry(p, 0)[0]
+        btop = self._uni_top(p)
+        dtab = {}
+        if self.doc_weight:
+            dtab = {w: n for w, n in self._doc_uni.items() if w.startswith(p)}
+            for n in dtab.values():
+                m1 += n * self.doc_weight
+        cand = {w for w in btop if w not in banned}
+        cand.update(g2, g3)
+        cand.update(w for w in dtab if not (w.startswith("<") or w in banned))
+        if top is None:
+            cand.update(self._user_entry(p, len(u))[1])
+        else:
+            need = top + len(cand)  # с запасом: лидеры по счёту могут уже быть среди кандидатов
+            while True:
+                _m, by_count, full = self._user_entry(p, need)
+                extra = [w for w in by_count if w not in cand][:top]
+                if len(extra) >= top or full:
+                    cand.update(extra)
+                    break
+                need *= 2
+        btop = set(btop)
         l2 = m2 / (m2 + self.k)
         l3 = m3 / (m3 + self.k)
-        probs = {}
-        for w in set(g1) | set(g2) | set(g3):
-            p1 = g1.get(w, 0) / m1 if m1 else 0.0
+        dw = self.doc_weight
+        items = []
+        for w in cand:
+            g1 = bu[w] if w in btop else 0
+            if w in u:
+                g1 += u[w] * USER_WEIGHT
+            if w in dtab:
+                g1 += dtab[w] * dw
+            p1 = g1 / m1 if m1 else 0.0
             p2 = l2 * (g2.get(w, 0) / m2 if m2 else 0.0) + (1 - l2) * p1
-            probs[w] = l3 * (g3.get(w, 0) / m3 if m3 else 0.0) + (1 - l3) * p2
+            items.append((w, l3 * (g3.get(w, 0) / m3 if m3 else 0.0) + (1 - l3) * p2))
         # равные вероятности — по слову: иначе порядок зависел бы от хэшей строк и менялся от запуска к запуску
-        return sorted(probs.items(), key=lambda x: (-x[1], x[0])), g2 + g3, g3
+        key = lambda x: (-x[1], x[0])
+        dist = sorted(items, key=key) if top is None else heapq.nsmallest(top, items, key=key)
+        return dist, g2 + g3, g3
 
     def surface(self, w: str) -> str:
         return self.user.case.get(w) or self.base.case.get(w) or w
 
     def _next_words(self, a: str, b: str) -> list[str]:
+        self._caches()
+        key = (a, b, self.max_extra_words, self.min_conf_extra, self.min_support, self.k)
+        if not self.doc_weight and key in self._next_cache:
+            return list(self._next_cache[key])
         out = []
         for _ in range(self.max_extra_words):
-            dist, sup = self.distribution(a, b, "")
+            dist, sup, _g3 = self._dist(a, b, "", top=1)
             if not dist:
                 break
             w, pr = dist[0]
@@ -382,6 +533,10 @@ class Predictor:
                 break
             out.append(self.surface(w))
             a, b = b, w
+        if not self.doc_weight:
+            if len(self._next_cache) > 5000:
+                self._next_cache.clear()
+            self._next_cache[key] = list(out)
         return out
 
     def _doc_update(self, text: str, prefix: str):
@@ -421,12 +576,13 @@ class Predictor:
             return None
         low = raw.lower()
         lo, hi = self.base.prefix_range(low)
-        if hi > lo or any(w.startswith(low) for w in self.user.uni):
+        self._caches()
+        if hi > lo or self._user_words(low):
             return None  # так начинается слово и в этой раскладке
         conv = raw.translate(EN2RU if m.re is LATIN_TAIL_RE else RU2EN)
         if not WORD_RE.fullmatch(conv):
             return None
-        dist, _sup, _g3 = self._dist(c2, c1, conv)
+        dist, _sup, _g3 = self._dist(c2, c1, conv, top=1)
         if not dist:
             return None
         w, pr = dist[0]
@@ -469,7 +625,7 @@ class Predictor:
             self._doc_update(text, prefix)
         if not prefix and text and not ends_space:
             return None
-        dist, sup, sup3 = self._dist(c2, c1, prefix)
+        dist, sup, sup3 = self._dist(c2, c1, prefix, top=8)  # лидер и до 8 вариантов для общей основы
         if not dist:
             return None
         low = prefix.lower()

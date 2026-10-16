@@ -349,6 +349,7 @@ def main(argv=None):
     ap.add_argument("--train", action="append", default=[], help="параметр BaseModel.train=значение (JSON)")
     ap.add_argument("--try", dest="tries", action="append", default=[],
                     help="серия гипотез в одном прогоне: \"a=1;b=2\", параметр обучения — \"train.x=1\"")
+    ap.add_argument("--resplit", action="store_true", help="с --save-baseline: новая граница выборки по свежим данным")
     ap.add_argument("--speed", action="store_true")
     ap.add_argument("--baseline", help="путь к базе (по умолчанию data/ или tests/fixtures для --synthetic)")
     a = ap.parse_args(argv)
@@ -369,7 +370,7 @@ def main(argv=None):
 
     path = Path(a.baseline) if a.baseline else (FIXTURE if a.synthetic else data_baseline())
     base = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-    split = None if (a.save_baseline or base is None) else base.get("split")
+    split = None if (base is None or a.resplit) else base.get("split")  # граница выборки живёт в базе
     if a.tries:
         return _series(cfg, split, base, a)
     res = run(cfg, split, overrides, a.notes, a.synthetic, a.chars, topts)
