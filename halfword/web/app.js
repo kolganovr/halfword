@@ -723,7 +723,8 @@ function stack3(g) {
 function insights(u, blocked) {
   const out = [];
   const fix = (src, pos) => src === "ngram" ? ["Частота подсказок", "#settings:freq"]
-    : src === "long" ? (pos === "line" ? ["Подсказки с новой строки", "#settings:llm_after_enter"] : ["Пауза до ✦✦", "#settings:llm_pause_ms"])
+    : src === "long" ? (pos === "line" ? ["Подсказки с новой строки", "#settings:llm_after_enter"]
+      : pos === "sent" ? ["Подсказки после точки", "#settings:llm_after_sentence"] : ["Пауза до ✦✦", "#settings:llm_pause_ms"])
     : ["Порог LLM", "#settings:llm_min_prob"];
   for (const s of u.sources) {
     const base = took(s.all);

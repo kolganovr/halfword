@@ -123,5 +123,35 @@ class AppLogicTest(unittest.TestCase):
         self.assertEqual([v.insert for v in me.variants], ["b", "a"])
 
 
+
+class AskLongPlaceTest(unittest.TestCase):
+    """✦✦ по умолчанию не спрашивается в начале строки и после точки (журнал: 0 принятых), посреди — да."""
+
+    def ask(self, buf, **cfg):
+        from types import SimpleNamespace
+        from unittest import mock
+        from halfword import app as A
+        from halfword import config as C
+        me = A.App.__new__(A.App)
+        me.cfg = C.Config(**cfg)
+        me.buf, me.buf_off, me.last_seq = buf, 0, 1
+        me.llm = SimpleNamespace(ready=True, request_long=mock.Mock())
+        me._can_suggest = lambda: True
+        me._long_suggestion = lambda: None
+        me._header = lambda: ""
+        me._ask_long(1)
+        return me.llm.request_long.called
+
+    def test_defaults(self):
+        self.assertTrue(self.ask("Сегодня я хочу "))
+        self.assertTrue(self.ask("Сегодня я хо"))
+        self.assertFalse(self.ask("Готово. "))
+        self.assertFalse(self.ask("Готово.\n"))
+
+    def test_settings_turn_back_on(self):
+        self.assertTrue(self.ask("Готово. ", llm_after_sentence=True))
+        self.assertTrue(self.ask("Готово.\n", llm_after_enter=True))
+
+
 if __name__ == "__main__":
     unittest.main()

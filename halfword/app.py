@@ -24,7 +24,7 @@ from .model import DOC_WEIGHT, WORD_CH, WORD_RE, BaseModel, Predictor, Suggestio
 from .overlay import Overlay
 from .stats import Stats
 from .trainer import Trainer
-from .usage import MissWatch, Usage, layout_info
+from .usage import MissWatch, Usage, layout_info, place
 from .winhook import (GATE_DELIMS, LANG_ENGLISH, LANG_RUSSIAN, MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared,
                       focus_hkl, layout_pair, primary_lang, process_name, send_key, send_text, switch_layout,
                       user32, window_header)
@@ -957,6 +957,8 @@ class App:
         if not prefix and not ends_space:
             return  # сразу после знака без пробела не гадаем
         if self.buf.endswith("\n") and not self.cfg.llm_after_enter:
+            return
+        if place(self.buf) == "sent" and not getattr(self.cfg, "llm_after_sentence", True):
             return
         off = self.buf_off
         cb = lambda r: self.cmds.put(lambda: self._on_long(r, off))
