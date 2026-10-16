@@ -1086,7 +1086,7 @@ class App:
         if s.level == "layout":
             self.usage.layout_shown(self._layout_info(s, bool(CYR_RE.search(s.insert))), self.exe)
         else:
-            self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0)
+            self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0, conf=s.confidence)
 
     def _hide(self):
         self.overlay.hide()

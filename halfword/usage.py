@@ -32,7 +32,7 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .model import WORD_CH
+from .model import TRAILING_WORD_RE as PREFIX_RE, WORD_CH
 
 WORD = re.compile(rf"[{WORD_CH}\-'’]")
 SENT_END = ".!?…"
@@ -161,8 +161,10 @@ class MissWatch:
 
 
 class Episode:
-    def __init__(self, full: str, src: str, pos: str, app: str, now: float, gap: int, idle: int, variants: int):
+    def __init__(self, full: str, src: str, pos: str, app: str, now: float, gap: int, idle: int, variants: int,
+                 conf: float | None = None, lvl: str = "", plen: int = 0):
         self.full = full            # подсказка целиком от точки показа
+        self.conf, self.lvl, self.plen = conf, lvl, plen  # уверенность, уровень, длина префикса — для калибровки
         self.typed = ""             # что набрано от точки показа (руками и принятием)
         self.acc = 0                # символов вставлено принятием
         self.src = self.src0 = src
@@ -195,6 +197,8 @@ class Episode:
             r["var"], r["cyc"] = self.variants, self.cycles
         if self.miss:
             r["miss"] = self.miss
+        if self.conf is not None:
+            r["conf"], r["lvl"], r["plen"] = round(self.conf, 3), self.lvl, self.plen
         return r
 
 
@@ -212,7 +216,7 @@ class Usage:
         self.swap = False
 
     # --- события от приложения ---
-    def shown(self, buf: str, insert: str, level: str, app: str, variants: int = 0):
+    def shown(self, buf: str, insert: str, level: str, app: str, variants: int = 0, conf: float | None = None):
         now = self.clock()
         src = {"llm": "llm", "long": "long"}.get(level, "ngram")
         for ep in self.open:
@@ -236,7 +240,8 @@ class Usage:
         gaps = sorted(self.gaps)
         gap = int(gaps[len(gaps) // 2]) if gaps else 0
         idle = int((now - self.last_key) * 1000) if self.last_key else 0
-        ep = Episode(insert, src, place(buf), app, now, gap, idle, variants)
+        m = PREFIX_RE.search(buf[-40:])
+        ep = Episode(insert, src, place(buf), app, now, gap, idle, variants, conf, level, len(m.group(0)) if m else 0)
         self.open.append(ep)
         self.cur = ep
         if len(self.open) > MAX_OPEN:
