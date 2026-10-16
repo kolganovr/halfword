@@ -292,7 +292,7 @@ class Predictor:
         self.base = base
         self.user = user or UserModel()
         # пороги показа
-        self.min_conf_word = 0.35     # дописать слово целиком
+        self.min_conf_word = 0.41     # дописать слово целиком
         self.min_conf_next = 0.40     # предложить следующее слово после пробела
         self.min_conf_extra = 0.60    # продлить подсказку ещё словом
         self.min_support = 3          # сколько раз пара/тройка должна встретиться
@@ -300,7 +300,7 @@ class Predictor:
         self.max_extra_words = 2
         self.min_insert = 2           # подсказку короче (символов) не показывать
         self.next_min_tri = 0         # следующее слово без префикса: опора в триграмме не меньше
-        self.short_penalty = 0.07     # +к порогу за каждый символ префикса короче 4
+        self.short_penalty = 0.02     # +к порогу за каждый символ префикса короче 4
         self.k = 6.0                  # сглаживание интерполяции (подобрано evaluate.py)
         # опыты на стенде (halfword.bench, отклонены: выигрыш на Claude не повторился на другом окне)
         self.k2: float | None = None  # своё k для биграмм / триграмм (None — self.k)

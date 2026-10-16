@@ -24,7 +24,7 @@ def cases() -> list:
     cfg = bench._load_cfg(synthetic=True)
     train, tests, _meta = bench.load_corpora(cfg, None, synthetic=True)
     base = BaseModel.train(train)
-    p = bench.make_predictor(base, cfg)
+    p = bench.make_predictor(base, cfg, {"min_conf_word": 0.35, "short_penalty": 0.07})  # пороги эталона
     rng = random.Random(7)
     words = _made_up_words(rng, 300)
     # личный словарь: выдуманные слова и фразы из корпуса
