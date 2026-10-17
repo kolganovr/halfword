@@ -24,7 +24,7 @@ from .model import DOC_WEIGHT, WORD_CH, WORD_RE, BaseModel, Predictor, Suggestio
 from .overlay import Overlay
 from .stats import Stats
 from .trainer import Trainer
-from .usage import MissWatch, Usage, layout_info
+from .usage import MissWatch, Usage, layout_info, place
 from .winhook import (GATE_DELIMS, LANG_ENGLISH, LANG_RUSSIAN, MAGIC, VK_BACK, VK_RIGHT, VK_TAB, Hook, Shared,
                       focus_hkl, layout_pair, primary_lang, process_name, send_key, send_text, switch_layout,
                       user32, window_header)
@@ -45,6 +45,29 @@ SWITCH_OVERRIDE_S = 0.4  # столько хук переводит нажати
 MANUAL_UNDO_S = 3.0    # повторная ручная клавиша за это время откатывает перевод
 SELECTION_MAX = 2000   # выделение длиннее ручная клавиша не переводит: целиком его из поля не прочитать
 LAYOUT_STATE_MAX = 500  # столько слов со счётчиком отказов храним (самые давние забываем)
+POLL_FAST_MS = 8       # шаг главного цикла, пока печатают
+POLL_STEPS = ((2.0, POLL_FAST_MS), (5.0, 25), (15.0, 50))  # секунд без нажатий → шаг, мс
+POLL_IDLE_MS = 100     # шаг в простое: событие из хука или потока будит цикл сразу (WakeQueue)
+
+
+def poll_delay(idle_s: float) -> int:
+    """Шаг главного цикла: часто, пока печатают, и всё реже в простое."""
+    for limit, ms in POLL_STEPS:
+        if idle_s < limit:
+            return ms
+    return POLL_IDLE_MS
+
+
+class WakeQueue(queue.Queue):
+    """Очередь, которая будит главный цикл: положивший (хук, поток) не ждёт следующего круга _poll и не трогает tk."""
+
+    def __init__(self, wake: threading.Event):
+        super().__init__()
+        self.wake = wake
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self.wake.set()
 
 
 def typed_after(buf: str, buf_off: int, text: str, off: int) -> str | None:
@@ -116,10 +139,14 @@ class App:
     manual = None          # последний ручной перевод — повторная клавиша откатит
     miss = None            # MissWatch: пропуски раскладки для журнала
     layout_state = None    # счётчики отмен по словам (data/layout_state.json)
+    _poll_job = None       # запланированный круг _poll (after id)
+    _poll_ms = POLL_FAST_MS
+    _activity = 0.0        # monotonic последнего события хука
 
     def __init__(self):
         self.cfg = C.Config.load()
-        self.cmds: queue.Queue = queue.Queue()  # команды из трея и потоков
+        self._wake = threading.Event()
+        self.cmds: queue.Queue = WakeQueue(self._wake)  # команды из трея и потоков
         self.trainer = Trainer(lambda ev: self.cmds.put(lambda: self._on_train(ev)))
         self._base_seq = 0        # какая загрузка базовой модели последняя (старые ответы выбрасываем)
         self.predictor = Predictor(self._load_base(), UserModel.load(C.USER_MODEL))
@@ -127,7 +154,7 @@ class App:
         self.predictor.user.decay(time.time())  # набранное руками тает: полураспад год
         self.stats = Stats(C.STATS_FILE)
         self.usage = Usage(C.USAGE_FILE)
-        self.events: queue.Queue = queue.Queue()
+        self.events: queue.Queue = WakeQueue(self._wake)
         self.shared = Shared(enabled=self.cfg.enabled, accept_right=self.cfg.accept_key == "right",
                              layout_hotkey=self.cfg.layout_hotkey)
         self.hook = Hook(self.events, self.shared)
@@ -525,13 +552,39 @@ class App:
             log.exception("веб-панель не запустилась")
         self._start_tray()
         log.info("запущено; вкл/выкл — Ctrl+Alt+F12 или иконка в трее")
-        self.root.after(10, self._poll)
+        self.root.bind("<<HalfwordWake>>", self._wake_poll)
+        self._poll_job = self.root.after(10, self._poll)
+        threading.Thread(target=self._waker, daemon=True, name="poll-wake").start()
         try:
             self.root.mainloop()
         finally:
             self._shutdown()
 
+    def _waker(self):
+        """Поток: в очереди событие, а цикл спит длинным шагом — будим его виртуальным событием tk.
+
+        Сам хук tk не трогает (вызов tk из чужого потока ждёт главный поток), он только взводит флаг."""
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self._poll_ms <= POLL_FAST_MS:
+                continue  # и так проснётся через 8 мс
+            try:
+                self.root.event_generate("<<HalfwordWake>>", when="tail")
+            except RuntimeError:
+                time.sleep(0.05)  # главный цикл ещё не запущен или уже остановлен
+            except tk.TclError:
+                return  # окно уничтожено — выход
+
+    def _wake_poll(self, _ev=None):
+        """Круг цикла сейчас, а не по долгому таймеру простоя."""
+        if self._poll_job is None:
+            return
+        self.root.after_cancel(self._poll_job)
+        self._poll()
+
     def _poll(self):
+        self._poll_job = None
         changed = typed = False
         try:
             while True:
@@ -569,7 +622,11 @@ class App:
         if time.time() - self.last_save > SAVE_EVERY_S:
             self._save()
         self._tick()
-        self.root.after(8, self._poll)
+        now = time.monotonic()
+        if changed:
+            self._activity = now
+        self._poll_ms = poll_delay(now - self._activity)
+        self._poll_job = self.root.after(self._poll_ms, self._poll)
 
     def _save(self):
         self.predictor.user.decay(time.time())  # раз в неделю, если приложение не перезапускали
@@ -901,6 +958,8 @@ class App:
             return  # сразу после знака без пробела не гадаем
         if self.buf.endswith("\n") and not self.cfg.llm_after_enter:
             return
+        if place(self.buf) == "sent" and not getattr(self.cfg, "llm_after_sentence", True):
+            return
         off = self.buf_off
         cb = lambda r: self.cmds.put(lambda: self._on_long(r, off))
         self.llm.request_long(seq, self.buf, prefix, cb, self._header())
@@ -1010,7 +1069,7 @@ class App:
         long = s.level == "long"
         llm = long or s.level == "llm"
         hint = self.key_hint + (" ✦✦" if long else " ✦" if llm else " ⇄" if s.level == "layout"
-                                else " ✎" if s.level == "snippet" else "")
+                                else " ✎" if s.level in ("snippet", "fix") else "")  # ✎ — набранное заменится
         if long and len(self.variants) > 1:
             hint += f" {self.vi + 1}/{len(self.variants)}"
         self.overlay.show(s.insert, x, y, h, hint, long=long)
@@ -1027,7 +1086,7 @@ class App:
         if s.level == "layout":
             self.usage.layout_shown(self._layout_info(s, bool(CYR_RE.search(s.insert))), self.exe)
         else:
-            self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0)
+            self.usage.shown(self.buf, s.insert, s.level, self.exe, len(self.variants) if long else 0, conf=s.confidence)
 
     def _hide(self):
         self.overlay.hide()

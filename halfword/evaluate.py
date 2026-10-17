@@ -4,12 +4,14 @@ python -X utf8 -m halfword.evaluate [макс_символов]
 """
 from __future__ import annotations
 
+import re
 import sys
 import time
 
 from . import config as C
+from . import noise as N
 from .corpus import read_text_file, text_files
-from .model import BaseModel, Predictor, UserModel
+from .model import BaseModel, Predictor, UserModel, parse_context
 
 SEP = " ,.;:!?)\n"
 
@@ -22,18 +24,37 @@ def split_corpus(holdout_every: int = 10):
     return [read_text_file(f) for f in train], [read_text_file(f) for f in test]
 
 
-def simulate(pred: Predictor, text: str, learn: bool = True) -> dict:
+def simulate(pred: Predictor, text: str, learn: bool = True, rows: list | None = None,
+             times: list | None = None, noise: float = 0.0, noise_seed: int = N.SEED) -> dict:
+    """rows — сюда по каждому засчитанному показу: (в слове?, уверенность, длина префикса, уровень, длина вставки,
+    верно?, сэкономлено) — только числа; times — длительность каждого suggest, мс.
+    noise > 0 — доля слов с синтетическими опечатками (см. simulate_noisy); 0 — прежний путь без изменений."""
+    if noise > 0:
+        return simulate_noisy(pred, text, noise, noise_seed, learn, rows, times)
     shown = accepted = wrong = saved = 0
     last_wrong = None
     buf = ""
     i = 0
     n = len(text)
+    clock = time.perf_counter
     while i < n:
-        s = pred.suggest(buf) if buf.strip() else None
+        if buf.strip():
+            if times is not None:
+                t0 = clock()
+                s = pred.suggest(buf)
+                times.append((clock() - t0) * 1000)
+            else:
+                s = pred.suggest(buf)
+        else:
+            s = None
         if s:
             rest = text[i:]
             tail = rest[len(s.insert):len(s.insert) + 1]
             ok = rest.startswith(s.insert) and (not s.whole_word or tail == "" or tail in SEP)
+            if rows is not None and (ok or s.insert != last_wrong):
+                plen = len(parse_context(buf)[2])
+                gain = len(s.insert + (" " if s.whole_word and tail == " " else "")) - 1 if ok else 0
+                rows.append((plen > 0, round(s.confidence, 4), plen, s.level, len(s.insert), ok, gain))
             if ok:
                 accepted += 1
                 shown += 1
@@ -61,6 +82,136 @@ def simulate(pred: Predictor, text: str, learn: bool = True) -> dict:
             buf = (buf + ch)[-400:]
         i += 1
     return {"chars": n, "shown": shown, "accepted": accepted, "wrong": wrong, "saved": saved}
+
+
+_TAIL_WORD = re.compile(r"[^\W\d_]+$")
+
+
+def _lcp(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _after_autocorrect(ac, buf: str, word: str) -> str:
+    """Слово после автозамены предиктора (то же слово, если замены нет)."""
+    s = ac(buf)
+    if not s or s.replace > len(word):
+        return word
+    return word[:len(word) - s.replace] + s.insert
+
+
+def simulate_noisy(pred: Predictor, text: str, noise: float, seed: int = N.SEED, learn: bool = True,
+                   rows: list | None = None, times: list | None = None) -> dict:
+    """Набор с опечатками: часть слов (доля noise, от 3 букв) «пользователь» печатает испорченными, цель — text.
+
+    Нажатия: каждый набранный символ, Tab на принятие подсказки (стирание replace делает приложение), Backspace и
+    допечатка вручную. Неисправленную опечатку пользователь чинит после слова: Backspace до первого расхождения и
+    допечатка верного хвоста. Автозамена pred.autocorrect(buf) (если есть) вызывается на разделителе и нажатий не
+    стоит; чужая замена в другое слово и замена верного слова чинятся так же вручную.
+    saved = len(text) − нажатия, как и в прежнем счёте (там это сумма вставок минус Tab)."""
+    plan = N.plan(text, noise, seed)
+    ac = getattr(pred, "autocorrect", None)
+    st = {"typo_words": 0, "typo_avoided": 0, "fixed_ok": 0, "fixed_bad": 0, "typo_manual": 0, "false_fix": 0}
+    shown = accepted = wrong = keys = 0
+    last_wrong = None
+    buf = ""
+    i = 0
+    n = len(text)
+    typo = None  # [верное слово, набираемое, набрано символов] — слово с опечаткой, которое сейчас печатается
+    skip_ac = False
+    clock = time.perf_counter
+    while i < n:
+        if typo is None and i in plan:
+            typo = [plan[i][0], plan[i][1], 0]
+            st["typo_words"] += 1
+        k = typo[2] if typo else 0
+        tp = typo[1][:k] if typo else ""
+        s = None
+        if buf.strip():
+            t0 = clock()
+            s = pred.suggest(buf)
+            if times is not None:
+                times.append((clock() - t0) * 1000)
+        if s:
+            r = s.replace
+            if r <= k:
+                start, content = i, tp[:k - r] + s.insert
+            else:
+                start, content = i - (r - k), s.insert
+            e = start + len(content)
+            tail = text[e:e + 1]
+            ok = start >= 0 and text.startswith(content, start) and (not s.whole_word or tail == "" or tail in SEP)
+            sp = " " if s.whole_word and tail == " " else ""
+            if rows is not None and (ok or s.insert != last_wrong):
+                plen = len(parse_context(buf)[2])
+                gain = len(s.insert + sp) - 1 if ok else 0
+                rows.append((plen > 0, round(s.confidence, 4), plen, s.level, len(s.insert), ok, gain))
+            if ok:
+                accepted += 1
+                shown += 1
+                keys += 1  # Tab
+                if typo:
+                    st["typo_avoided" if text.startswith(tp, i) else "fixed_ok"] += 1
+                buf = buf[:max(0, len(buf) - r)]
+                for ch in s.insert + sp:
+                    if ch in SEP and learn:
+                        pred.learn_from(buf)
+                    buf += ch
+                i = e + len(sp)
+                typo = None
+                last_wrong = None
+                skip_ac = False
+                continue
+            if s.insert != last_wrong:
+                wrong += 1
+                shown += 1
+                last_wrong = s.insert
+        if typo and k < len(typo[1]):  # печатаем следующую букву испорченного слова
+            buf = (buf + typo[1][k])[-400:]
+            typo[2] += 1
+            keys += 1
+            skip_ac = False
+            continue
+        if typo:  # слово набрано целиком: автозамена, иначе ручная правка
+            clean, typed = typo[0], typo[1]
+            got = _after_autocorrect(ac, buf, typed) if ac else typed
+            if got == clean:
+                st["fixed_ok"] += 1
+            else:
+                st["fixed_bad" if got != typed else "typo_manual"] += 1
+                d = _lcp(got, clean)
+                keys += len(got) - d + len(clean) - d
+            buf = buf[:len(buf) - len(typed)] + clean
+            i += len(clean)
+            typo = None
+            skip_ac = True
+            continue
+        ch = text[i]
+        if ch in SEP and ac and not skip_ac:  # верное слово не должно меняться автозаменой
+            m = _TAIL_WORD.search(buf)
+            if m:
+                got = _after_autocorrect(ac, buf, m.group())
+                if got != m.group():
+                    st["false_fix"] += 1
+                    d = _lcp(got, m.group())
+                    keys += len(got) - d + len(m.group()) - d
+        keys += 1
+        if ch == "\n":
+            if learn:
+                pred.learn_from(buf)
+            buf = ""
+        else:
+            if ch in SEP and learn:
+                pred.learn_from(buf)
+            buf = (buf + ch)[-400:]
+        i += 1
+        skip_ac = False
+    return {"chars": n, "shown": shown, "accepted": accepted, "wrong": wrong, "saved": n - keys,
+            "words": len(N.WORD_RE.findall(text)), **st}
 
 
 def main():

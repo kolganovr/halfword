@@ -10,6 +10,7 @@ class ParseHintTest(unittest.TestCase):
         self.assertEqual(O.parse_hint("Tab"), ("Tab", "", ""))
         self.assertEqual(O.parse_hint("Tab ✦"), ("Tab", "✦", ""))
         self.assertEqual(O.parse_hint("Tab ✦✦ 2/3"), ("Tab", "✦✦", "2/3"))
+        self.assertEqual(O.parse_hint("Tab ✎"), ("Tab", "✎", ""))
         self.assertEqual(O.parse_hint("Tab 1/2"), ("Tab", "", "1/2"))
 
     def test_garbage_falls_back_to_key(self):

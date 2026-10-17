@@ -54,6 +54,20 @@ class EpisodeTest(unittest.TestCase):
         r = u.rows[-1]
         self.assertEqual((r["out"], r["fix"], r["src"], r["pos"], r["acc"]), ("accepted", "kept", "ngram", "word", 4))
 
+    def test_calibration_fields(self):
+        """Уверенность, уровень и длина префикса — числа для калибровки порогов, без текста."""
+        u = tracker()
+        u.shown("Нужно сделать докум", "ент", "tri", "notepad.exe", conf=0.61234)
+        u.accept("ент ")
+        type_(u, "и отправить его сегодня")
+        r = u.rows[-1]
+        self.assertEqual((r["conf"], r["lvl"], r["plen"]), (0.612, "tri", 5))
+        u2 = tracker()
+        u2.shown("Нужно ", "сделать", "llm", "notepad.exe")  # без уверенности — полей нет
+        u2.dismiss()
+        u2.reset("x")
+        self.assertNotIn("conf", u2.rows[-1])
+
     def test_typed_by_hand(self):
         u = tracker()
         u.shown("Нужно сделать докум", "ент", "ngram", "x.exe")

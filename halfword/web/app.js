@@ -604,7 +604,7 @@ function makeForm(d, opts = {}) {
 // ---------- Обучение ----------
 const REASONS = { manual: "вручную", schedule: "по расписанию", auto: "автоматически", corpus: "новые тексты", start: "при запуске",
   first: "первый запуск", apply_pending: "применена отложенная", rollback: "откат модели" };
-const RESULTS = { accepted: ["принята", "ok"], rejected: ["отклонена", "accent"], cancelled: ["отменено", ""], error: ["ошибка", "bad"],
+const RESULTS = { accepted: ["принята", "ok"], accepted_unchecked: ["принята без проверки", "accent"], rejected: ["отклонена", "accent"], cancelled: ["отменено", ""], error: ["ошибка", "bad"],
   rollback: ["откат", ""] };
 function resultTag(r) {
   const [name, cls] = RESULTS[r.result] || [r.result || "—", ""];
@@ -653,6 +653,9 @@ async function train() {
         h("div", { class: "row" }, h("span", {}, s.label || s.stage || "обучение…"), N(pct(p))),
         h("div", { class: "track", role: "progressbar", "aria-valuenow": Math.round(p * 100), "aria-valuemin": 0, "aria-valuemax": 100 },
           h("i", { style: `width:${p * 100}%` }))) : null,
+      !running && s.last && s.last.result === "accepted_unchecked" ? h("div", { class: "banner" },
+        h("div", {}, h("p", {}, "Последняя модель принята без проверки качества"),
+          h("div", { class: "muted" }, "Не нашлось отложенных текстов: ни файлов из папок, ни сообщений. Добавьте папку с текстами ниже или экспорт Telegram — тогда новая модель будет подменять старую, только если подсказывает не хуже."))) : null,
       s.pending ? h("div", { class: "banner" },
         h("div", {}, h("p", {}, "Отложенная модель ждёт применения"), typeof s.pending === "object" ? h("div", { class: "muted" }, plain(s.pending)) : null),
         h("button", { class: "btn primary", disabled: running, onclick: async () => {
@@ -720,7 +723,8 @@ function stack3(g) {
 function insights(u, blocked) {
   const out = [];
   const fix = (src, pos) => src === "ngram" ? ["Частота подсказок", "#settings:freq"]
-    : src === "long" ? (pos === "line" ? ["Подсказки с новой строки", "#settings:llm_after_enter"] : ["Пауза до ✦✦", "#settings:llm_pause_ms"])
+    : src === "long" ? (pos === "line" ? ["Подсказки с новой строки", "#settings:llm_after_enter"]
+      : pos === "sent" ? ["Подсказки после точки", "#settings:llm_after_sentence"] : ["Пауза до ✦✦", "#settings:llm_pause_ms"])
     : ["Порог LLM", "#settings:llm_min_prob"];
   for (const s of u.sources) {
     const base = took(s.all);
