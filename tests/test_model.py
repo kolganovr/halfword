@@ -93,3 +93,42 @@ class StatsTest(unittest.TestCase):
         d = Stats(path)._today()
         self.assertEqual((d["typed"], d["shown"], d["accepted"], d["saved"]), (10, 2, 1, 4))
         self.assertIn("сэкономлено нажатий: 4", Stats(path).report())
+
+
+class TypoPrefixTest(unittest.TestCase):
+    CORPUS = ["Документ готов. Документы на визу. Документов много. Документа нет.",
+              "Поездка в Казань. Поездка в Казань скоро. Поездка в Казань весной."] * 6
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = BaseModel.train(cls.CORPUS)
+
+    def make(self, penalty):
+        p = Predictor(self.base, UserModel())
+        p.typo_penalty = penalty
+        p.typo_min_count = 5  # корпус теста мал
+        return p
+
+    def test_off_by_default(self):
+        p = self.make(0.0)
+        self.assertIsNone(p.suggest("Скоро поедзка"))
+        self.assertEqual(Predictor(self.base, UserModel()).typo_penalty, 0.0)
+
+    def test_swapped_letters(self):
+        s = self.make(0.9).suggest("Скоро поедзка")
+        self.assertIsNotNone(s)
+        self.assertEqual((s.level, s.replace, s.insert), ("fix", len("поедзка"), "поездка"))
+
+    def test_neighbor_key_and_case(self):
+        s = self.make(0.9).suggest("Это Поездуа")
+        self.assertIsNotNone(s)
+        self.assertEqual((s.level, s.replace), ("fix", len("Поездуа")))
+        self.assertEqual(s.insert, "Поездка")
+
+    def test_exact_prefix_wins(self):
+        p = self.make(0.9)
+        self.assertEqual(p.suggest("Скоро поезд").level, "uni")
+        self.assertIsNone(p.suggest("Скоро поездка"))  # слово набрано целиком
+
+    def test_short_prefix_untouched(self):
+        self.assertNotEqual(getattr(self.make(0.9).suggest("Скоро пое"), "level", None), "fix")

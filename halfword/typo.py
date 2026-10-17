@@ -115,6 +115,24 @@ def near_edits1(word: str) -> set[str]:
     return out
 
 
+@lru_cache(maxsize=4096)
+def prefix_variants(prefix: str, limit: int = 60) -> tuple[str, ...]:
+    """Варианты набранного начала слова с одной правкой, не больше limit: сначала перестановки соседних букв и
+    соседние клавиши (самые частые опечатки), потом лишняя или удвоенная буква."""
+    n = len(prefix)
+    out: dict[str, None] = {}
+    for i in range(n - 1):
+        if prefix[i] != prefix[i + 1]:
+            out[prefix[:i] + prefix[i + 1] + prefix[i] + prefix[i + 2:]] = None
+    for i in range(n):
+        for nb in neighbors(prefix[i]):
+            out[prefix[:i] + nb + prefix[i + 1:]] = None
+    for i in range(n):
+        out[prefix[:i] + prefix[i + 1:]] = None
+    out.pop(prefix, None)
+    return tuple(out)[:limit]
+
+
 @lru_cache(maxsize=None)
 def default_lexicons() -> tuple[Lexicon, ...]:
     """Словари русского и английского из lexicon/ (читаются один раз на процесс)."""

@@ -18,6 +18,7 @@ from itertools import accumulate
 from pathlib import Path
 from typing import Iterable
 
+from . import typo
 from .layout import LayoutDetector, LayoutFix
 
 WORD_CH = r"0-9A-Za-zÀ-ÿА-Яа-яЁё"
@@ -303,6 +304,12 @@ class Predictor:
         self.min_insert = 2           # подсказку короче (символов) не показывать
         self.next_min_tri = 0         # следующее слово без префикса: опора в триграмме не меньше
         self.short_penalty = 0.02     # +к порогу за каждый символ префикса короче 4
+        self.typo_penalty = 0.0       # дополнение при одной ошибке в префиксе: множитель вероятности; 0 — выключено
+        self.typo_min_prefix = 3      # исправлять префикс не короче стольких букв
+        self.typo_min_conf = 0.6      # порог показа исправления (выше обычного)
+        self.typo_min_count = 60      # слово из базы не реже стольких раз (редкие — чаще сами опечатки)
+        self.typo_exact_empty = True   # исправлять, только если с набранного начала не начинается ни одно слово
+        self.typo_variants = 60       # сколько вариантов префикса перебирать
         self.k = 6.0                  # сглаживание интерполяции (подобрано evaluate.py)
         # опыты на стенде (halfword.bench, отклонены: выигрыш на Claude не повторился на другом окне)
         self.k2: float | None = None  # своё k для биграмм / триграмм (None — self.k)
@@ -639,6 +646,48 @@ class Predictor:
             self._doc_update(text, prefix)
         if not prefix and text and not ends_space:
             return None
+        s = self._complete(c2, c1, prefix, sent_start)
+        if s is None and self.typo_penalty > 0 and len(prefix) >= self.typo_min_prefix:
+            s = self._typo_fix(c2, c1, prefix, sent_start)
+        return s
+
+    def _typo_fix(self, c2: str, c1: str, prefix: str, sent_start: bool) -> Suggestion | None:
+        """В набранном начале слова одна ошибка: стереть его и вставить слово целиком."""
+        low = prefix.lower()
+        self._caches()
+        if self.base.uni.get(low, 0) or low in self.user.uni:
+            return None  # набрано настоящее слово
+        if self.typo_exact_empty:
+            lo, hi = self.base.prefix_range(low)
+            if hi > lo or self._user_words(low):
+                return None
+        base_uni, user_uni, banned = self.base.uni, self.user.uni, self.banned
+        found = []
+        for v in typo.prefix_variants(low, self.typo_variants):
+            top = self._uni_top(v)
+            best = max((base_uni[w] for w in top if w not in banned), default=0)
+            if best >= self.typo_min_count:
+                found.append((best, v))
+        if not found:
+            return None
+        found.sort(reverse=True)
+        pick = None
+        for _n, v in found[:3]:
+            dist, _sup, _g3 = self._dist(c2, c1, v, top=1)
+            if not dist:
+                continue
+            w, pr = dist[0]
+            pr *= self.typo_penalty
+            if base_uni.get(w, 0) >= self.typo_min_count and (pick is None or pr > pick[1]):
+                pick = (w, pr)
+        if pick is None or pick[1] < self.typo_min_conf:
+            return None
+        word = match_case(self.surface(pick[0]), prefix, sent_start)
+        return Suggestion(insert=word, word=word, confidence=pick[1], level="fix", whole_word=True,
+                          replace=len(prefix))
+
+    def _complete(self, c2: str, c1: str, prefix: str, sent_start: bool) -> Suggestion | None:
+        """Дописать слово или следующее по префиксу, как набрано."""
         dist, sup, sup3 = self._dist(c2, c1, prefix, top=8)  # лидер и до 8 вариантов для общей основы
         if not dist:
             return None

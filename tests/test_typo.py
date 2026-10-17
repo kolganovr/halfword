@@ -118,3 +118,20 @@ class ProbableTyposTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrefixVariantsTest(unittest.TestCase):
+    def test_kinds(self):
+        got = typo.prefix_variants("пирв")
+        self.assertIn("прив", got)      # перестановка
+        self.assertIn("пирв"[:-1], got)  # лишняя буква в конце
+        self.assertNotIn("пирв", got)
+
+    def test_neighbor_key(self):
+        self.assertIn("документ", typo.prefix_variants("докумкнт"))  # к рядом с е
+        self.assertIn("документ", typo.prefix_variants("докуиент"))  # и рядом с м
+
+    def test_limit_and_order(self):
+        got = typo.prefix_variants("поздравляю", 12)
+        self.assertEqual(len(got), 12)
+        self.assertEqual(got[0], "опздравляю")  # перестановки идут первыми
