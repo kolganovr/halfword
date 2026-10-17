@@ -659,6 +659,17 @@ class HookLayoutKeysTest(unittest.TestCase):
         self.assertFalse(self.key(W.VK_BACK))     # дальше обычный Backspace
         self.assertEqual(self.events(), [("bs",)])
 
+    def test_caps_follows_system_not_presses(self):
+        # хук пропустил CapsLock (экран блокировки, окно администратора): регистр всё равно по системе
+        self.sh.enabled = False
+        for caps in (False, True, False):
+            with mock.patch.object(W, "caps_on", lambda c=caps: c):
+                self.key(W.VK_CAPITAL)
+                self.key(0x41)
+            ch = self.events()[-1][1]
+            self.assertTrue(ch.isalpha())
+            self.assertEqual(ch.isupper(), caps)
+
     def test_other_key_disarms_undo(self):
         self.sh.undo_armed = True
         self.key(W.VK_RETURN)

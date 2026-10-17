@@ -117,6 +117,15 @@ def _down(vk: int) -> bool:
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def caps_on() -> bool:
+    """CapsLock включён. В потоке хука GetKeyState верен для всех нажатий, кроме самого CapsLock (отстаёт на него).
+
+    Раньше флаг вели сами, переключая на каждое нажатие: хук не видит CapsLock на экране блокировки и в окнах
+    с правами администратора, и флаг переворачивался до перезапуска — весь набор шёл в буфер заглавными.
+    """
+    return bool(user32.GetKeyState(VK_CAPITAL) & 1)
+
+
 def process_name(hwnd) -> str:
     pid = wt.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -392,8 +401,6 @@ class Hook:
         self._shift_down = False   # Shift нажат; пока _shift_clean, других клавиш до его отпускания не было
         self._shift_clean = False
         self._last_tap = 0.0       # когда был предыдущий чистый тап Shift (для double_shift)
-        # состояние CapsLock ведём сами: GetKeyState в потоке хука не обновляется
-        self.caps = bool(user32.GetKeyState(VK_CAPITAL) & 1)
         self._thread_id = 0
         self._kb_proc = HOOKPROC(self._on_kb)
         self._ms_proc = HOOKPROC(self._on_mouse)
@@ -428,8 +435,6 @@ class Hook:
             if vk in SHIFTS and kb.dwExtraInfo != REPLAY:
                 self._shift_up()
             return False
-        if vk == VK_CAPITAL:
-            self.caps = not self.caps
         sh = self.shared
         if vk in SHIFTS:
             if kb.dwExtraInfo == REPLAY:
@@ -591,7 +596,7 @@ class Hook:
             state[VK_SHIFT] = 0x80
         if altgr:
             state[VK_CONTROL] = state[VK_MENU] = 0x80
-        if self.caps:
+        if caps_on():
             state[VK_CAPITAL] = 0x01
         buf = ctypes.create_unicode_buffer(8)
         # флаг 0x4: не трогать состояние клавиатуры (иначе ломаются мёртвые клавиши)
