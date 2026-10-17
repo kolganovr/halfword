@@ -6,10 +6,13 @@ python -X utf8 -m halfword.bench --set k=4          # гипотеза: атри
 python -X utf8 -m halfword.bench --notes <папка>    # добавить корпус заметок (каждый 10-й файл — проверка)
 python -X utf8 -m halfword.bench --speed            # задержка suggest на фразе: base_model.pkl + user_model.json
 python -X utf8 -m halfword.bench --synthetic        # то же на выдуманном корпусе, база в tests/fixtures/
+python -X utf8 -m halfword.bench --noise 0.03       # на отложенном тексте 3% слов с синтетическими опечатками
 
 Отложенная выборка — по времени: последние 10% сообщений Claude Code и Telegram. Граница и конец выборки
 запоминаются в базе, поэтому новые сообщения не сдвигают её и прогоны сравнимы. Модель учится на остальном так же,
 как переобучение (веса и полураспад из config.json). Печатаются только числа: текст сообщений в вывод не попадает.
+С шумом (--noise, --noise-seed) экономия считается против длины чистого текста: нажатия включают ручные правки
+неисправленных опечаток. Сравнение — с базой шума (ключ "noisy" в файле базы), если она есть; база не обновляется сама.
 Код выхода 1 — хуже базы сверх допуска.
 """
 from __future__ import annotations
@@ -28,6 +31,7 @@ from pathlib import Path
 
 from . import config as C
 from .corpus import claude_messages, iter_telegram, read_text_file, telegram_messages, text_files
+from . import noise as N
 from .evaluate import simulate
 from .model import BaseModel, Predictor, UserModel
 from .trainer import is_holdout
@@ -37,6 +41,8 @@ NOTES_EVERY = 10
 CHARS = 50_000            # потолок проверочного текста на корпус
 TOL_SAVED = 0.2           # п.п. экономии
 TOL_PREC = 1.0            # п.п. доли верных
+TOL_FIX = 1.0             # п.п. доли исправленных опечаток (с шумом)
+TOL_FALSE = 0.5           # ложных замен на 1000 слов (с шумом)
 TOL_P95 = 0.2             # +20% к p95 suggest (и не меньше 0.2 мс — иначе это шум таймера)
 SPEED_PHRASE = ("Сегодня я хочу написать короткое сообщение про работу и потом проверить "
                 "как это всё работает на практике")
@@ -201,18 +207,20 @@ def _pct(xs: list[float], q: float) -> float:
     return xs[min(len(xs) - 1, int(len(xs) * q))]
 
 
-def measure(pred_factory, text: str, rows: list | None = None) -> dict:
-    """Метрики одного корпуса: числа, без текста. rows — сюда же показы (см. evaluate.simulate)."""
+def measure(pred_factory, text: str, rows: list | None = None, noise: float = 0.0,
+            noise_seed: int = N.SEED) -> dict:
+    """Метрики одного корпуса: числа, без текста. rows — сюда же показы (см. evaluate.simulate).
+    С noise > 0 добавляются колонки опечаток (их нет в прогоне без шума)."""
     rows = [] if rows is None else rows
     times = []
-    r = simulate(pred_factory(), text, rows=rows, times=times)
+    r = simulate(pred_factory(), text, rows=rows, times=times, noise=noise, noise_seed=noise_seed)
     word = [x for x in rows if x[0]]
     nxt = [x for x in rows if not x[0]]
 
     def prec(g):
         return round(100 * sum(1 for x in g if x[5]) / len(g), 2) if g else 0.0
 
-    return {
+    out = {
         "saved": round(100 * r["saved"] / r["chars"], 3) if r["chars"] else 0.0,
         "shown_1k": round(1000 * r["shown"] / r["chars"], 1) if r["chars"] else 0.0,
         "prec": round(100 * r["accepted"] / r["shown"], 2) if r["shown"] else 0.0,
@@ -224,6 +232,13 @@ def measure(pred_factory, text: str, rows: list | None = None) -> dict:
         "p50_ms": round(statistics.median(times), 3) if times else 0.0,
         "p95_ms": round(_pct(times, 0.95), 3), "max_ms": round(max(times), 2) if times else 0.0,
     }
+    if noise > 0:
+        tw = r["typo_words"]
+        out.update(noise=noise, words=r["words"], typo_words=tw, typo_avoided=r["typo_avoided"],
+                   fixed_ok=r["fixed_ok"], fixed_ok_pct=round(100 * r["fixed_ok"] / tw, 2) if tw else 0.0,
+                   fixed_bad=r["fixed_bad"], typo_manual=r["typo_manual"], false_fix=r["false_fix"],
+                   false_fix_1k=round(1000 * r["false_fix"] / r["words"], 2) if r["words"] else 0.0)
+    return out
 
 
 def train_model(train: list, opts: dict | None = None, parts: dict | None = None) -> tuple[BaseModel, dict]:
@@ -244,14 +259,15 @@ def train_model(train: list, opts: dict | None = None, parts: dict | None = None
 
 def run(cfg, base_split: dict | None, overrides: dict | None = None, notes: str | None = None,
         synthetic: bool = False, chars: int = CHARS, train_opts: dict | None = None,
-        corpora: tuple | None = None, model: tuple | None = None, rows: dict | None = None) -> dict:
+        corpora: tuple | None = None, model: tuple | None = None, rows: dict | None = None,
+        noise: float = 0.0, noise_seed: int = N.SEED) -> dict:
     """Полный прогон: корпуса → модель → метрики. corpora/model — уже загруженные (для серии гипотез)."""
     train, tests, meta = corpora or load_corpora(cfg, base_split, notes, synthetic, chars)
     base, minfo = model or train_model(train, train_opts, meta.get("_parts", {}).get("parts"))
     out = {"model": minfo, "corpora": {}, "split": {k: v["split"] for k, v in meta.items() if v.get("split")}}
     for name, text in tests.items():
         got = rows.setdefault(name, []) if rows is not None else None
-        m = measure(lambda: make_predictor(base, cfg, overrides), text, got)
+        m = measure(lambda: make_predictor(base, cfg, overrides), text, got, noise, noise_seed)
         m.update(meta[name])
         m.pop("split", None)
         out["corpora"][name] = m
@@ -279,12 +295,29 @@ def compare(cur: dict, base: dict) -> tuple[list[str], bool, bool]:
             bad.append(f"верных {dp:+.2f} п.п.")
         if b["p95_ms"] and dt > max(0.2, TOL_P95 * b["p95_ms"]):
             bad.append(f"p95 {b['p95_ms']:.2f}→{m['p95_ms']:.2f} мс")
+        if "fixed_ok_pct" in b and "fixed_ok_pct" in m:  # колонки шума сравниваем, только если они есть в базе
+            dfx, dff = m["fixed_ok_pct"] - b["fixed_ok_pct"], m["false_fix_1k"] - b["false_fix_1k"]
+            if dfx < -TOL_FIX:
+                bad.append(f"исправлено {dfx:+.1f} п.п.")
+            if dff > TOL_FALSE:
+                bad.append(f"ложных замен {dff:+.2f} на 1000 слов")
         worse = worse or bool(bad)
         better = better or ds > 0.05 or (ds >= -0.01 and dp > 0.5)
         lines.append(f"{name}: экономия {b['saved']:.2f}→{m['saved']:.2f} ({ds:+.2f}), верных {b['prec']:.1f}→"
                      f"{m['prec']:.1f} ({dp:+.1f}), p95 {b['p95_ms']:.2f}→{m['p95_ms']:.2f} мс"
+                     + (f", исправлено {b['fixed_ok_pct']:.1f}→{m['fixed_ok_pct']:.1f}%, ложных "
+                        f"{b['false_fix_1k']:.2f}→{m['false_fix_1k']:.2f}" if "fixed_ok_pct" in b and "fixed_ok_pct" in m
+                        else "")
                      + ("  ХУЖЕ: " + ", ".join(bad) if bad else ""))
     return lines, worse, better
+
+
+def _noise_part(m: dict) -> str:
+    if "typo_words" not in m:
+        return ""
+    return (f" | шум {m['noise']:g}: опечаток {m['typo_words']}, исправлено {m['fixed_ok_pct']:.1f}% "
+            f"(в другое слово {m['fixed_bad']}, вручную {m['typo_manual']}, не допущено {m['typo_avoided']}), "
+            f"ложных замен {m['false_fix_1k']:.2f} на 1000 слов")
 
 
 def report(res: dict) -> str:
@@ -296,7 +329,7 @@ def report(res: dict) -> str:
             f"{name:9} {m['chars']:6} симв. | экономия {m['saved']:6.2f}% | показов на 1000 {m['shown_1k']:5.1f} | "
             f"верных {m['prec']:5.1f}% | в слове {m['word_shown']} ({m['word_prec']:.1f}%) | "
             f"след. слово {m['next_shown']} ({m['next_prec']:.1f}%) | suggest p50 {m['p50_ms']:.2f} "
-            f"p95 {m['p95_ms']:.2f} max {m['max_ms']:.1f} мс")
+            f"p95 {m['p95_ms']:.2f} max {m['max_ms']:.1f} мс" + _noise_part(m))
     return "\n".join(lines)
 
 
@@ -369,6 +402,8 @@ def main(argv=None):
     ap.add_argument("--brief", action="store_true", help="серия: строка на гипотезу и корпус")
     ap.add_argument("--resplit", action="store_true", help="с --save-baseline: новая граница выборки по свежим данным")
     ap.add_argument("--speed", action="store_true")
+    ap.add_argument("--noise", type=float, default=0.0, help="доля слов с синтетическими опечатками в проверочном тексте")
+    ap.add_argument("--noise-seed", type=int, default=N.SEED, help="зерно шума")
     ap.add_argument("--baseline", help="путь к базе (по умолчанию data/ или tests/fixtures для --synthetic)")
     a = ap.parse_args(argv)
     cfg = _load_cfg(a.synthetic)
@@ -389,13 +424,31 @@ def main(argv=None):
     path = Path(a.baseline) if a.baseline else (FIXTURE if a.synthetic else data_baseline())
     base = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
     split = None if (base is None or a.resplit) else base.get("split")  # граница выборки живёт в базе
+    nkey = f"{a.noise:g}:{a.noise_seed}"
+    cmp_base = base if a.noise <= 0 else ((base or {}).get("noisy", {}).get(nkey))
     if a.tries:
-        return _series(cfg, split, base, a)
+        return _series(cfg, split, cmp_base, a)
     rows = {} if a.rows else None
-    res = run(cfg, split, overrides, a.notes, a.synthetic, a.chars, topts, rows=rows)
+    res = run(cfg, split, overrides, a.notes, a.synthetic, a.chars, topts, rows=rows, noise=a.noise,
+              noise_seed=a.noise_seed)
     print(report(res))
     if a.rows:
         Path(a.rows).write_text(json.dumps(rows), encoding="utf-8")
+    if a.noise > 0:  # база шума живёт в ключе "noisy" общей базы; чистая часть не трогается, сама не обновляется
+        if a.save_baseline and base is not None:
+            base.setdefault("noisy", {})[nkey] = {"corpora": res["corpora"]}
+            path.write_text(json.dumps(base, ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"база шума {nkey} записана: {path.name}")
+            return 0
+        if cmp_base is None:
+            print(f"базы для шума {nkey} нет — не сравниваю")
+            return 0
+        lines, worse, _better = compare(res, cmp_base)
+        print("\n".join(lines))
+        if worse:
+            print("ХУЖЕ базы сверх допуска")
+            return 1
+        return 0
     if a.save_baseline or base is None:
         save_baseline(res, path, cfg)
         print(f"база записана: {path.name}")
@@ -414,8 +467,9 @@ def main(argv=None):
 _W: dict = {}
 
 
-def _worker_init(cfg, split, notes, synthetic, chars):
-    _W.update(cfg=cfg, split=split, corpora=load_corpora(cfg, split, notes, synthetic, chars), models={})
+def _worker_init(cfg, split, notes, synthetic, chars, noise=0.0, noise_seed=N.SEED):
+    _W.update(cfg=cfg, split=split, corpora=load_corpora(cfg, split, notes, synthetic, chars), models={},
+              noise=noise, noise_seed=noise_seed)
 
 
 def _worker_run(spec: str) -> dict:
@@ -426,7 +480,15 @@ def _worker_run(spec: str) -> dict:
     key = json.dumps(topts, sort_keys=True)
     if key not in _W["models"]:
         _W["models"][key] = train_model(_W["corpora"][0], topts, _W["corpora"][2].get("_parts", {}).get("parts"))
-    return run(_W["cfg"], _W["split"], over, corpora=_W["corpora"], model=_W["models"][key])
+    return run(_W["cfg"], _W["split"], over, corpora=_W["corpora"], model=_W["models"][key],
+               noise=_W["noise"], noise_seed=_W["noise_seed"])
+
+
+def _noise_brief(m: dict) -> str:
+    if "typo_words" not in m:
+        return ""
+    return (f" | опеч. {m['typo_words']} исправл. {m['fixed_ok_pct']:.1f}% плохо {m['fixed_bad']} "
+            f"ложных/1000 {m['false_fix_1k']:.2f}")
 
 
 def _brief(spec: str, res: dict, base: dict | None) -> str:
@@ -436,7 +498,8 @@ def _brief(spec: str, res: dict, base: dict | None) -> str:
         d = f" ({m['saved'] - b['saved']:+.2f} / {m['prec'] - b['prec']:+.1f})" if b else ""
         out.append(f"{spec or 'как есть':42} {name:8} экономия {m['saved']:6.2f} верных {m['prec']:5.1f}{d} | "
                    f"на 1000 {m['shown_1k']:5.1f} | в слове {m['word_shown']} {m['word_prec']:.1f}% "
-                   f"{m['word_saved']} | след. {m['next_shown']} {m['next_prec']:.1f}% {m['next_saved']}")
+                   f"{m['word_saved']} | след. {m['next_shown']} {m['next_prec']:.1f}% {m['next_saved']}"
+                   + _noise_brief(m))
     return "\n".join(out)
 
 
@@ -446,12 +509,12 @@ def _series(cfg, split, base, a) -> int:
     if a.jobs > 1:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(a.jobs, initializer=_worker_init,
-                                 initargs=(cfg, split, a.notes, a.synthetic, a.chars)) as ex:
+                                 initargs=(cfg, split, a.notes, a.synthetic, a.chars, a.noise, a.noise_seed)) as ex:
             results = ex.map(_worker_run, specs)
             for spec, res in zip(specs, results):
                 _print_res(spec, res, base, a.brief)
         return 0
-    _worker_init(cfg, split, a.notes, a.synthetic, a.chars)
+    _worker_init(cfg, split, a.notes, a.synthetic, a.chars, a.noise, a.noise_seed)
     for spec in specs:
         _print_res(spec, _worker_run(spec), base, a.brief)
     return 0
