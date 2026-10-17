@@ -219,7 +219,14 @@ class Usage:
     def shown(self, buf: str, insert: str, level: str, app: str, variants: int = 0, conf: float | None = None):
         now = self.clock()
         src = {"llm": "llm", "long": "long"}.get(level, "ngram")
+        for ep in list(self.open):
+            if ep.lvl == "fix" and not (level == "fix" and ep.full == insert):
+                self._close(ep, "lost")  # исправление слова не продлевается: другое слово или другой уровень
         for ep in self.open:
+            if level == "fix" and ep.lvl == "fix":
+                self.cur = ep  # то же исправление пересчитано на следующей букве: один показ
+                self.swap = False
+                return
             t = ep.typed + insert
             if ep.div is None and (t.startswith(ep.full) or ep.full.startswith(t)):
                 if len(t) > len(ep.full):
@@ -256,6 +263,8 @@ class Usage:
                 self._lay_close("ignored")
         for ep in list(self.open):
             self._step(ep)
+            if ep.lvl == "fix":
+                continue  # insert заменяет набранное слово, а не продолжает его: сверять нечего
             ep.typed += ch
             self._check(ep)
         if self.fix:
@@ -267,6 +276,8 @@ class Usage:
         self._lay_close("ignored")
         for ep in list(self.open):
             self._step(ep)
+            if ep.lvl == "fix":
+                continue
             if not ep.typed:
                 self._close(ep, "erased")
                 continue

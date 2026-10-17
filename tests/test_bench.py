@@ -48,8 +48,7 @@ class BenchRatchetTest(unittest.TestCase):
         for name, m in noisy["corpora"].items():
             self.assertGreater(m["typo_words"], 0, name)
             self.assertEqual(m["typo_words"], m["typo_avoided"] + m["fixed_ok"] + m["fixed_bad"] + m["typo_manual"], name)
-            self.assertEqual(m["fixed_ok"], 0)  # у текущего предиктора нет исправления опечаток
-            self.assertEqual(m["false_fix"], 0)
+            self.assertEqual(m["false_fix"], 0)  # автозамены у предиктора нет
             self.assertLess(m["saved"], self.res["corpora"][name]["saved"], name)  # опечатки стоят нажатий
 
 

@@ -1069,7 +1069,7 @@ class App:
         long = s.level == "long"
         llm = long or s.level == "llm"
         hint = self.key_hint + (" ✦✦" if long else " ✦" if llm else " ⇄" if s.level == "layout"
-                                else " ✎" if s.level == "snippet" else "")
+                                else " ✎" if s.level in ("snippet", "fix") else "")  # ✎ — набранное заменится
         if long and len(self.variants) > 1:
             hint += f" {self.vi + 1}/{len(self.variants)}"
         self.overlay.show(s.insert, x, y, h, hint, long=long)

@@ -109,10 +109,10 @@ class TypoPrefixTest(unittest.TestCase):
         p.typo_min_count = 5  # корпус теста мал
         return p
 
-    def test_off_by_default(self):
+    def test_off_at_zero(self):
         p = self.make(0.0)
         self.assertIsNone(p.suggest("Скоро поедзка"))
-        self.assertEqual(Predictor(self.base, UserModel()).typo_penalty, 0.0)
+        self.assertEqual(Predictor(self.base, UserModel()).typo_penalty, 1.0)  # по умолчанию включено
 
     def test_swapped_letters(self):
         s = self.make(0.9).suggest("Скоро поедзка")
