@@ -36,6 +36,7 @@ USER_WEIGHT = 3   # во сколько раз набранное руками �
 BACKOFF = 0.4
 DOC_WEIGHT = 3    # слово/пара из текущего поля весит столько вхождений корпуса за раз
 USER_HALF_LIFE_DAYS = 365  # затухание набранного руками
+CASE_TRUST = 20   # с такого счёта в корпусе регистр слова берём из корпуса, а не из последнего набора
 
 # не та раскладка: клавиши ЙЦУКЕН ↔ QWERTY
 _EN = "`qwertyuiop[]asdfghjkl;'zxcvbnm,.~QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>"
@@ -180,7 +181,11 @@ class UserModel:
         self.uni[w] += 1
         self.bi[c1][w] += 1
         self.tri[c2 + " " + c1][w] += 1
-        if word != w and not word.isdigit() and c1 != BOS:
+        if word.isdigit():
+            pass
+        elif word == w:
+            self.case.pop(w, None)  # набрал строчными — заглавная форма была разовой (капс, ошибка регистра)
+        elif c1 != BOS:
             self.case[w] = word
         self.dirty = True
         self._changed(w, 1)
@@ -536,6 +541,10 @@ class Predictor:
         return m2 / (m2 + k2), m3 / (m3 + k3)
 
     def surface(self, w: str) -> str:
+        # Слово, которое корпус видел часто, пишем как в корпусе: личная форма — последний набор и может быть
+        # разовым капсом («НЕ», «ВОТ»). Личная форма решает для редких и новых слов.
+        if self.base.uni.get(w, 0) >= CASE_TRUST:
+            return self.base.case.get(w) or w
         return self.user.case.get(w) or self.base.case.get(w) or w
 
     def _next_words(self, a: str, b: str) -> list[str]:

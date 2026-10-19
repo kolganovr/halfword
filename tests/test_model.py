@@ -63,6 +63,17 @@ class ModelTest(unittest.TestCase):
             a, b = p.suggest(text), fresh.suggest(text)
             self.assertEqual(a and (a.insert, a.confidence), b and (b.insert, b.confidence), (i, text))
 
+    def test_case_from_user_typing(self):
+        """Разовый капс частого слова не делает подсказки капсом; набор строчными стирает запомненную форму."""
+        p = Predictor(BaseModel.train(["ну как дела"] * 25), UserModel())
+        p.learn_from("ну КАК ")
+        self.assertEqual(p.surface("как"), "как")  # корпус знает слово строчным
+        p.learn_from("ну Котик ")
+        self.assertEqual(p.surface("котик"), "Котик")  # редкое слово — как набрал
+        p.learn_from("ну котик ")
+        self.assertEqual(p.surface("котик"), "котик")
+        self.assertNotIn("котик", p.user.case)
+
     def test_roundtrip(self):
         import tempfile, pathlib
         d = pathlib.Path(tempfile.mkdtemp())
