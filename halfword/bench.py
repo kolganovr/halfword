@@ -192,6 +192,7 @@ def make_predictor(base: BaseModel, cfg, overrides: dict | None = None) -> Predi
     p.min_insert = cfg.min_insert_chars
     p.next_min_tri = cfg.next_min_tri
     p.doc_weight = 3.0 if cfg.doc_cache else 0.0
+    p.morph_bonus = cfg.morph_bonus
     p.banned = {w.lower() for w in cfg.banned_words}
     for k, v in (overrides or {}).items():
         if not hasattr(p, k):
@@ -226,6 +227,8 @@ def measure(pred_factory, text: str, rows: list | None = None, noise: float = 0.
         "prec": round(100 * r["accepted"] / r["shown"], 2) if r["shown"] else 0.0,
         "shown": r["shown"], "accepted": r["accepted"],
         "word_shown": len(word), "word_prec": prec(word),
+        "wrong_form": r.get("wrong_form", 0),
+        "form_pct": round(100 * r.get("wrong_form", 0) / r["wrong"], 2) if r.get("wrong") else 0.0,
         "word_saved": sum(x[6] for x in word),
         "next_shown": len(nxt), "next_prec": prec(nxt),
         "next_saved": sum(x[6] for x in nxt),
@@ -328,6 +331,7 @@ def report(res: dict) -> str:
         lines.append(
             f"{name:9} {m['chars']:6} симв. | экономия {m['saved']:6.2f}% | показов на 1000 {m['shown_1k']:5.1f} | "
             f"верных {m['prec']:5.1f}% | в слове {m['word_shown']} ({m['word_prec']:.1f}%) | "
+            f"форма {m['wrong_form']}/{m['shown'] - m['accepted']} ({m['form_pct']:.1f}% ошибок) | "
             f"след. слово {m['next_shown']} ({m['next_prec']:.1f}%) | suggest p50 {m['p50_ms']:.2f} "
             f"p95 {m['p95_ms']:.2f} max {m['max_ms']:.1f} мс" + _noise_part(m))
     return "\n".join(lines)
@@ -498,7 +502,8 @@ def _brief(spec: str, res: dict, base: dict | None) -> str:
         d = f" ({m['saved'] - b['saved']:+.2f} / {m['prec'] - b['prec']:+.1f})" if b else ""
         out.append(f"{spec or 'как есть':42} {name:8} экономия {m['saved']:6.2f} верных {m['prec']:5.1f}{d} | "
                    f"на 1000 {m['shown_1k']:5.1f} | в слове {m['word_shown']} {m['word_prec']:.1f}% "
-                   f"{m['word_saved']} | след. {m['next_shown']} {m['next_prec']:.1f}% {m['next_saved']}"
+                   f"{m['word_saved']} | след. {m['next_shown']} {m['next_prec']:.1f}% {m['next_saved']} "
+                   f"| форма {m['form_pct']:.1f}% p95 {m['p95_ms']:.2f}"
                    + _noise_brief(m))
     return "\n".join(out)
 

@@ -18,7 +18,7 @@ from itertools import accumulate
 from pathlib import Path
 from typing import Iterable
 
-from . import typo
+from . import morph, typo
 from .layout import LayoutDetector, LayoutFix
 
 WORD_CH = r"0-9A-Za-zÀ-ÿА-Яа-яЁё"
@@ -320,6 +320,8 @@ class Predictor:
         self.k2: float | None = None  # своё k для биграмм / триграмм (None — self.k)
         self.k3: float | None = None
         self.witten_bell = False      # вес уровня m/(m + k·число разных продолжений) вместо m/(m + k)
+        self.morph_bonus = 0.0        # T-083: согласование формы с левым словом (pymorphy3); 0 — выключено
+        self.morph_scope = "lemma"    # lemma — менять порядок только среди форм лидера; all — всех кандидатов
         self.banned: set[str] = set()  # не подсказывать (нижний регистр)
         self.doc_weight = 0.0         # вес слов текущего поля; 0 — выключено
         self.layout_fix = False       # подсказка при не той раскладке
@@ -702,6 +704,8 @@ class Predictor:
             return None
         low = prefix.lower()
         w, pr = dist[0]
+        if self.morph_bonus > 0 and c1:  # формы одной леммы: выбираем согласованную с левым словом
+            w, pr = morph.rerank(dist, c1, self.morph_bonus, self.morph_scope)[0]
         if w == low:
             return None
         if not prefix:

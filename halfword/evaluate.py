@@ -9,6 +9,7 @@ import sys
 import time
 
 from . import config as C
+from . import morph
 from . import noise as N
 from .corpus import read_text_file, text_files
 from .model import BaseModel, Predictor, UserModel, parse_context
@@ -31,12 +32,13 @@ def simulate(pred: Predictor, text: str, learn: bool = True, rows: list | None =
     noise > 0 — доля слов с синтетическими опечатками (см. simulate_noisy); 0 — прежний путь без изменений."""
     if noise > 0:
         return simulate_noisy(pred, text, noise, noise_seed, learn, rows, times)
-    shown = accepted = wrong = saved = 0
+    shown = accepted = wrong = saved = wrong_form = 0
     last_wrong = None
     buf = ""
     i = 0
     n = len(text)
     clock = time.perf_counter
+    count_form = morph.available()
     while i < n:
         if buf.strip():
             if times is not None:
@@ -71,6 +73,8 @@ def simulate(pred: Predictor, text: str, learn: bool = True, rows: list | None =
                 wrong += 1
                 shown += 1
                 last_wrong = s.insert
+                if count_form and s.whole_word and _is_form_miss(buf, text, i, s.word):
+                    wrong_form += 1
         ch = text[i]
         if ch == "\n":
             if learn:
@@ -81,10 +85,22 @@ def simulate(pred: Predictor, text: str, learn: bool = True, rows: list | None =
                 pred.learn_from(buf)
             buf = (buf + ch)[-400:]
         i += 1
-    return {"chars": n, "shown": shown, "accepted": accepted, "wrong": wrong, "saved": saved}
+    return {"chars": n, "shown": shown, "accepted": accepted, "wrong": wrong, "saved": saved,
+            "wrong_form": wrong_form}
 
 
 _TAIL_WORD = re.compile(r"[^\W\d_]+$")
+
+
+_HEAD_WORD = re.compile(r"[^\W\d_]+")
+
+
+def _is_form_miss(buf: str, text: str, i: int, shown_word: str) -> bool:
+    """Показано неверное слово, но его лемма та же, что у слова, которое дальше набрано (форма, не другое слово)."""
+    prefix = parse_context(buf)[2]
+    m = _HEAD_WORD.match(text, i)
+    real = (prefix + (m.group() if m else "")).lower()
+    return bool(real) and morph.same_lemma(shown_word.lower(), real)
 
 
 def _lcp(a: str, b: str) -> int:
