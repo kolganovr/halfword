@@ -99,8 +99,8 @@ def _last_metric(tag: str) -> float | None:
 ACCEPTED = ("accepted", "accepted_unchecked")
 
 
-def _current_tag() -> str | None:
-    """На какой отложенной выборке не училась модель, что сейчас в работе (с учётом откатов)."""
+def _current_run() -> dict | None:
+    """Запись обучения модели, что сейчас в работе (с учётом откатов)."""
     skip = 0
     for r in history(10_000):
         if r.get("result") == "rollback":
@@ -109,8 +109,20 @@ def _current_tag() -> str | None:
             if skip:
                 skip -= 1
                 continue
-            return r.get("holdout")
+            return r
     return None
+
+
+def _current_tag() -> str | None:
+    """На какой отложенной выборке не училась модель, что сейчас в работе."""
+    r = _current_run()
+    return r.get("holdout") if r else None
+
+
+def _current_unseen_md() -> bool:
+    """Модель в работе обучена без заметок — любые отложенные заметки ей незнакомы."""
+    r = _current_run()
+    return bool(r) and ((r.get("sources") or {}).get("notes") or {}).get("files") == 0
 
 
 def sources_info(cfg) -> list[dict]:
@@ -282,7 +294,8 @@ def _run(job: dict, q):
     metric, hold_chars, used = check(model, hold_texts, 90, 95)
     # модель в работе не училась на этой выборке — меряем и её на том же тексте: сдвиг выборки не мешает сравнению
     prev_now = None
-    if metric is not None and job.get("current_tag") == tag and Path(P["base"]).exists():
+    same = job.get("current_tag") == tag or (tag.startswith("md/") and job.get("current_unseen_md"))
+    if metric is not None and same and Path(P["base"]).exists():
         try:
             prev_now = check(BaseModel.load(Path(P["base"])), used, 95, 99, deadline_on=False)[0]
         except Exception:
@@ -363,6 +376,7 @@ class Trainer:
             ctx = mp.get_context("spawn")
             q = ctx.Queue()
             job = {"paths": P, "holdout_every": self.holdout_every, "current_tag": _current_tag(),
+                   "current_unseen_md": _current_unseen_md(),
                    "cfg": {k: getattr(cfg, k) for k in (*C.PREDICTOR_KEYS, "tg_half_life_years", "tg_weight",
                                                        "claude_weight")}}
             proc = ctx.Process(target=_worker, args=(job, q), daemon=True)

@@ -141,8 +141,27 @@ class Config:
             cfg.layout_mode = "suggest"
         if cfg.layout_hotkey not in LAYOUT_HOTKEYS:
             cfg.layout_hotkey = "pause"
+        cfg._seen = asdict(cfg)
         return cfg
 
     def save(self):
+        """Пишет настройки, изменённые в этом процессе. Остальные ключи берутся из файла: их могли поправить
+        руками или другой копией программы, пока эта работала, — иначе запись из памяти их затирала бы."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+        out = asdict(self)
+        seen = getattr(self, "_seen", None)
+        if seen is not None and CONFIG_FILE.exists():
+            try:
+                disk = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                disk = {}
+            if isinstance(disk, dict):
+                for k, v in out.items():
+                    if k in disk and v == seen.get(k) and disk[k] != v:
+                        out[k] = disk[k]
+                        setattr(self, k, disk[k])
+                out = {**{k: v for k, v in disk.items() if k not in out}, **out}  # чужие ключи не теряем
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, CONFIG_FILE)
+        self._seen = asdict(self)
